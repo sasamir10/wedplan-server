@@ -37,6 +37,27 @@ export const createBookingSchema = z.strictObject({
   message: z.string().trim().optional(),
 });
 
+const positiveQueryInteger = (maximum: number) =>
+  z
+    .string()
+    .regex(/^[1-9]\d*$/)
+    .transform(Number)
+    .pipe(z.number().int().min(1).max(maximum));
+
+export const vendorBookingQuerySchema = z
+  .strictObject({
+    status: bookingStatusSchema.optional(),
+    page: positiveQueryInteger(100_000).optional(),
+    limit: positiveQueryInteger(50).optional(),
+  })
+  .transform(({ page, limit, ...filters }) => ({
+    ...filters,
+    page: page ?? 1,
+    limit: limit ?? 10,
+  }));
+
+export type VendorBookingQuery = z.infer<typeof vendorBookingQuerySchema>;
+
 /**
  * Optional technical extension (not a mandatory field from the original assignment).
  *

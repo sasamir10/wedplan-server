@@ -8,10 +8,17 @@ import {
   createBookingSchema,
   type BookingDocument,
   type BookingResponse,
+  type BookingStatus,
   type ServiceSnapshot,
 } from '../models/booking.js';
 import { AppError } from '../utils/app-error.js';
 import { parseObjectId, toBetterAuthUserObjectId } from '../utils/object-id.js';
+
+interface CustomerPublicDocument {
+  _id: ObjectId;
+  name?: string | null;
+  image?: string | null;
+}
 
 interface VendorPublicDocument {
   _id: ObjectId;
@@ -35,6 +42,13 @@ interface BookingInput {
   eventDate: string;
   eventLocation: string;
   message?: string;
+}
+
+interface VendorBookingListInput {
+  vendorId: string;
+  status?: BookingStatus;
+  page: number;
+  limit: number;
 }
 
 function bookingsCollection(database: Db): Collection<BookingDocument> {
@@ -158,4 +172,143 @@ export async function createBooking(
   }
 
   return toBookingResponse(booking);
+}
+
+async function fetchCustomerDisplay(
+  database: Db,
+  customerIdHex: string,
+): Promise<{ name: string | null; image: string | null } | null> {
+  const customerObjectId = toBetterAuthUserObjectId(customerIdHex);
+  if (!customerObjectId) {
+    return null;
+  }
+  const customerDoc = await database
+    .collection<CustomerPublicDocument>('user')
+    .findOne(
+      { _id: customerObjectId },
+      { projection: { name: 1, image: 1, _id: 0 } },
+    );
+  if (!customerDoc) {
+    return null;
+  }
+  return {
+    name: customerDoc.name ?? null,
+    image: customerDoc.image ?? null,
+  };
+}
+
+interface VendorBookingEntry extends BookingResponse {
+  customer: { name: string | null; image: string | null } | null;
+}
+
+export async function getVendorBookings(
+  database: Db,
+  input: VendorBookingListInput,
+): Promise<{ bookings: VendorBookingEntry[]; pagination: { page: number; limit: number; total: number; totalPages: number } }> {
+  const { vendorId, status, page, limit } = input;
+
+  const filter: Record<string, unknown> = { vendorId };
+  if (status) filter.status = status;
+
+  const bookingsCollectionRef = bookingsCollection(database);
+  const [total, bookings] = await Promise.all([
+    bookingsCollectionRef.countDocuments(filter),
+    bookingsCollectionRef
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+  ]);
+
+  const customerIds = [...new Set(bookings.map((booking) => booking.customerId))];
+  const customerObjectIds = customerIds
+    .map((customerId) => toBetterAuthUserObjectId(customerId))
+    .filter((customerId): customerId is ObjectId => customerId !== null);
+
+  const customers: CustomerPublicDocument[] = customerObjectIds.length
+    ? await database
+        .collection<CustomerPublicDocument>('user')
+        .find({ _id: { $in: customerObjectIds } })
+        .project<CustomerPublicDocument>({ name: 1, image: 1 })
+        .toArray()
+    : [];
+  const customersById = new Map(
+    customers.map((customer) => [
+      customer._id.toHexString(),
+      {
+        name: customer.name ?? null,
+        image: customer.image ?? null,
+      },
+    ]),
+  );
+
+  return {
+    bookings: bookings.map((booking) => ({
+      ...toBookingResponse(booking),
+      customer: customersById.get(booking.customerId) ?? null,
+    })),
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  };
+}
+
+async function findBookingByIdAndVendor(
+  database: Db,
+  bookingId: ObjectId,
+  vendorId: string,
+): Promise<BookingDocument | null> {
+  return bookingsCollection(database).findOne({ _id: bookingId, vendorId });
+}
+
+export async function acceptBooking(
+  database: Db,
+  bookingId: string,
+  vendorId: string,
+): Promise<BookingResponse> {
+  const id = parseObjectId(bookingId, 'booking');
+
+  const updated = await bookingsCollection(database).findOneAndUpdate(
+    { _id: id, vendorId, status: 'Pending' },
+    { $set: { status: 'Accepted' } },
+    { returnDocument: 'after' },
+  );
+
+  if (updated) {
+    return toBookingResponse(updated as unknown as BookingDocument);
+  }
+
+  const existing = await findBookingByIdAndVendor(database, id, vendorId);
+  if (!existing) {
+    throw new AppError('Booking not found.', 404, true, 'BOOKING_NOT_FOUND');
+  }
+  throw new AppError('Only pending bookings can be accepted.', 409, true, 'BOOKING_ALREADY_PROCESSED');
+}
+
+export async function rejectBooking(
+  database: Db,
+  bookingId: string,
+  vendorId: string,
+): Promise<BookingResponse> {
+  const id = parseObjectId(bookingId, 'booking');
+
+  const updated = await bookingsCollection(database).findOneAndUpdate(
+    { _id: id, vendorId, status: 'Pending' },
+    { $set: { status: 'Rejected' } },
+    { returnDocument: 'after' },
+  );
+
+  if (updated) {
+    return toBookingResponse(updated as unknown as BookingDocument);
+  }
+
+  const existing = await findBookingByIdAndVendor(database, id, vendorId);
+  if (!existing) {
+    throw new AppError('Booking not found.', 404, true, 'BOOKING_NOT_FOUND');
+  }
+  throw new AppError('Only pending bookings can be rejected.', 409, true, 'BOOKING_ALREADY_PROCESSED');
 }
