@@ -1,7 +1,8 @@
 import type { Db, Document, Filter, ObjectId } from 'mongodb';
 import type { PublicServiceQuery } from '../models/public-service.js';
 import type { ServiceCategory } from '../models/service.js';
-import { toBetterAuthUserObjectId } from '../utils/object-id.js';
+import { AppError } from '../utils/app-error.js';
+import { parseObjectId, toBetterAuthUserObjectId } from '../utils/object-id.js';
 import type { ServiceDocument } from './service.service.js';
 
 interface PublicVendorDocument extends Document {
@@ -39,6 +40,14 @@ export interface PublicServiceResponse {
   createdAt: Date;
 }
 
+/**
+ * A single public service adds viewer context so the client can prevent a
+ * vendor from booking their own listing without exposing the vendor ID.
+ */
+export interface PublicServiceDetailResponse extends PublicServiceResponse {
+  isOwner: boolean;
+}
+
 const publicServiceFilter: Filter<ServiceDocument> = {
   status: 'Approved',
   availability: true,
@@ -50,6 +59,52 @@ function escapeRegularExpression(value: string): string {
 
 function publicText(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null;
+}
+
+function toPublicServiceResponse(
+  service: PublicServiceDocument,
+  vendor: PublicVendorSummary | null,
+): PublicServiceResponse {
+  return {
+    id: service._id.toHexString(),
+    serviceName: service.serviceName,
+    category: service.category,
+    description: service.description,
+    price: service.price,
+    location: service.location,
+    images: service.images,
+    vendor,
+    createdAt: service.createdAt,
+  };
+}
+
+async function readPublicVendors(
+  database: Db,
+  vendorIds: string[],
+): Promise<Map<string, PublicVendorSummary>> {
+  const vendorObjectIds = [...new Set(vendorIds)]
+    .map((vendorId) => toBetterAuthUserObjectId(vendorId))
+    .filter((vendorId): vendorId is ObjectId => vendorId !== null);
+
+  if (vendorObjectIds.length === 0) {
+    return new Map();
+  }
+
+  const vendors = await database
+    .collection<PublicVendorDocument>('user')
+    .find({ _id: { $in: vendorObjectIds } })
+    .project<PublicVendorDocument>({ name: 1, businessName: 1 })
+    .toArray();
+
+  return new Map(
+    vendors.map((vendor) => [
+      vendor._id.toHexString(),
+      {
+        name: publicText(vendor.name),
+        businessName: publicText(vendor.businessName),
+      },
+    ]),
+  );
 }
 
 async function readPublicServices(
@@ -106,41 +161,14 @@ async function readPublicServices(
     return [];
   }
 
-  const vendorIds = [...new Set(serviceDocuments.map((service) => service.vendorId))];
-  const vendorObjectIds = vendorIds
-    .map((vendorId) => toBetterAuthUserObjectId(vendorId))
-    .filter((vendorId): vendorId is ObjectId => vendorId !== null);
-  const vendors = vendorObjectIds.length
-    ? await database
-        .collection<PublicVendorDocument>('user')
-        .find({ _id: { $in: vendorObjectIds } })
-        .project<PublicVendorDocument>({ name: 1, businessName: 1 })
-        .toArray()
-    : [];
-  const vendorsById = new Map(
-    vendors.map((vendor) => [vendor._id.toHexString(), vendor]),
+  const vendorsById = await readPublicVendors(
+    database,
+    serviceDocuments.map((service) => service.vendorId),
   );
 
-  return serviceDocuments.map((service) => {
-    const vendor = vendorsById.get(service.vendorId);
-
-    return {
-      id: service._id.toHexString(),
-      serviceName: service.serviceName,
-      category: service.category,
-      description: service.description,
-      price: service.price,
-      location: service.location,
-      images: service.images,
-      vendor: vendor
-        ? {
-            name: publicText(vendor.name),
-            businessName: publicText(vendor.businessName),
-          }
-        : null,
-      createdAt: service.createdAt,
-    };
-  });
+  return serviceDocuments.map((service) =>
+    toPublicServiceResponse(service, vendorsById.get(service.vendorId) ?? null),
+  );
 }
 
 /** Lists approved, active services with only the vendor display fields needed publicly. */
@@ -154,4 +182,39 @@ export function listPublicServices(
 /** Lists up to six approved, active services, newest first with an ID tie-breaker. */
 export function listFeaturedPublicServices(database: Db): Promise<PublicServiceResponse[]> {
   return readPublicServices(database, {}, 6);
+}
+
+/**
+ * Reads one approved, active service for an authenticated viewer.
+ *
+ * Invalid, missing, unpublished, and inactive services all return the same 404
+ * so the endpoint never reveals whether an unpublished listing exists.
+ */
+export async function getPublicServiceById(
+  database: Db,
+  serviceId: string,
+  viewerId: string,
+): Promise<PublicServiceDetailResponse> {
+  let objectId: ObjectId;
+
+  try {
+    objectId = parseObjectId(serviceId, 'service');
+  } catch {
+    throw new AppError('Service not found.', 404, true, 'SERVICE_NOT_FOUND');
+  }
+
+  const service = await database
+    .collection<ServiceDocument>('services')
+    .findOne({ _id: objectId, ...publicServiceFilter });
+
+  if (!service) {
+    throw new AppError('Service not found.', 404, true, 'SERVICE_NOT_FOUND');
+  }
+
+  const vendorsById = await readPublicVendors(database, [service.vendorId]);
+
+  return {
+    ...toPublicServiceResponse(service, vendorsById.get(service.vendorId) ?? null),
+    isOwner: service.vendorId === viewerId,
+  };
 }

@@ -22,9 +22,14 @@ declare global {
   }
 }
 
-const jwks = createRemoteJWKSet(
-  new URL('/api/auth/jwks', env.BETTER_AUTH_URL),
-);
+let jwks: ReturnType<typeof createRemoteJWKSet> | undefined;
+
+// Defer remote key discovery until a token is actually verified so route
+// modules can be imported by isolated tests without live auth configuration.
+function getJwks() {
+  jwks ??= createRemoteJWKSet(new URL('/api/auth/jwks', env.BETTER_AUTH_URL));
+  return jwks;
+}
 
 // Authorization claims are a snapshot and may remain stale until the 15-minute token expires.
 
@@ -72,7 +77,7 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
   }
 
   try {
-    const { payload } = await jwtVerify(token, jwks, {
+    const { payload } = await jwtVerify(token, getJwks(), {
       issuer: env.BETTER_AUTH_URL,
       audience: env.BETTER_AUTH_URL,
       algorithms: ['EdDSA'],
