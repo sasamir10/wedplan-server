@@ -9,6 +9,7 @@ import { errorHandler } from './middleware/error-handler.js';
 import { notFound } from './middleware/not-found.js';
 import { healthRouter } from './routes/health.routes.js';
 import { protectedRouter } from './routes/protected.routes.js';
+import { createAdminServicesRouter } from './routes/admin-services.routes.js';
 import { createVendorServicesRouter } from './routes/vendor-services.routes.js';
 
 export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) {
@@ -32,6 +33,7 @@ export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) 
 
   app.use('/api', healthRouter);
   app.use('/api', protectedRouter);
+  app.use('/api/admin', createAdminServicesRouter(database));
   app.use('/api/vendor', createVendorServicesRouter(database, client));
 
   app.use(notFound);

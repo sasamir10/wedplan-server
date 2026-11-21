@@ -49,6 +49,14 @@ test('denies a customer on an admin-only route', () => {
   assertDenied(runAuthorization(['admin']), 403);
 });
 
+test('denies a vendor on an admin-only route', () => {
+  assertDenied(runAuthorization(['admin'], { ...baseIdentity, role: 'vendor' }), 403);
+});
+
+test('rejects unauthenticated access to an admin-only route', () => {
+  assertDenied(runAuthorization(['admin'], null), 401);
+});
+
 test('allows a vendor on a vendor-only route', () => {
   const result = runAuthorization(['vendor'], {
     ...baseIdentity,
