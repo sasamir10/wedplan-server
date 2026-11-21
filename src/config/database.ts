@@ -73,6 +73,39 @@ export function getMongoErrorDiagnostics(error: unknown): {
   };
 }
 
+/**
+ * Creates the idempotent indexes required by the `bookings` collection.
+ *
+ * Index creation is idempotent: repeating it with the same name and
+ * specification is a no-op. An incompatible pre-existing index (for example,
+ * the same name with a different specification) causes MongoDB to reject the
+ * operation, which surfaces as a clear startup failure rather than a
+ * destructive migration.
+ */
+export async function ensureBookingIndexes(database: Db): Promise<void> {
+  const bookings = database.collection('bookings');
+  await bookings.createIndexes([
+    {
+      key: { customerId: 1, status: 1 },
+      name: 'idx_bookings_customer_status',
+    },
+    {
+      key: { vendorId: 1, status: 1 },
+      name: 'idx_bookings_vendor_status',
+    },
+    {
+      key: { serviceId: 1, eventDate: 1 },
+      name: 'idx_bookings_service_date_unique_active',
+      unique: true,
+      partialFilterExpression: { status: { $in: ['Pending', 'Accepted'] } },
+    },
+    {
+      key: { createdAt: -1 },
+      name: 'idx_bookings_created_at_desc',
+    },
+  ]);
+}
+
 /** Opens the MongoDB connection once and verifies it with a ping. */
 export function connectToDatabase(): Promise<Db> {
   if (database) {
@@ -100,6 +133,8 @@ export function connectToDatabase(): Promise<Db> {
       await mongoClient.connect();
       const connectedDatabase = mongoClient.db(env.MONGODB_DB_NAME);
       await connectedDatabase.command({ ping: 1 });
+
+      await ensureBookingIndexes(connectedDatabase);
 
       database = connectedDatabase;
       console.info('MongoDB connection established.');
