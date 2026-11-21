@@ -64,8 +64,9 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const auth = createAuth(database, getMongoClient());
-    const app = createApp(auth);
+    const mongoClient = getMongoClient();
+    const auth = createAuth(database, mongoClient);
+    const app = createApp(auth, database, mongoClient);
 
     if (isShuttingDown) {
       return;

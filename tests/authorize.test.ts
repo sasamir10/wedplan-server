@@ -59,6 +59,10 @@ test('allows a vendor on a vendor-only route', () => {
   assert.equal(result.nextCalled, true);
 });
 
+test('denies a customer on a vendor-only route', () => {
+  assertDenied(runAuthorization(['vendor']), 403);
+});
+
 test('denies a vendor on a customer-only route', () => {
   assertDenied(
     runAuthorization(['customer'], { ...baseIdentity, role: 'vendor' }),
