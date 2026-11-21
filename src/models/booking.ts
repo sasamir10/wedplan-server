@@ -58,6 +58,20 @@ export const vendorBookingQuerySchema = z
 
 export type VendorBookingQuery = z.infer<typeof vendorBookingQuerySchema>;
 
+export const customerBookingQuerySchema = z
+  .strictObject({
+    status: bookingStatusSchema.optional(),
+    page: positiveQueryInteger(100_000).optional(),
+    limit: positiveQueryInteger(50).optional(),
+  })
+  .transform(({ page, limit, ...filters }) => ({
+    ...filters,
+    page: page ?? 1,
+    limit: limit ?? 10,
+  }));
+
+export type CustomerBookingQuery = z.infer<typeof customerBookingQuerySchema>;
+
 /**
  * Optional technical extension (not a mandatory field from the original assignment).
  *

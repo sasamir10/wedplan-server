@@ -312,3 +312,73 @@ export async function rejectBooking(
   }
   throw new AppError('Only pending bookings can be rejected.', 409, true, 'BOOKING_ALREADY_PROCESSED');
 }
+
+interface CustomerBookingListInput {
+  customerId: string;
+  status?: BookingStatus;
+  page: number;
+  limit: number;
+}
+
+export async function getCustomerBookings(
+  database: Db,
+  input: CustomerBookingListInput,
+): Promise<{ bookings: BookingResponse[]; pagination: { page: number; limit: number; total: number; totalPages: number } }> {
+  const { customerId, status, page, limit } = input;
+
+  const filter: Record<string, unknown> = { customerId };
+  if (status) filter.status = status;
+
+  const bookingsCollectionRef = bookingsCollection(database);
+  const [total, bookings] = await Promise.all([
+    bookingsCollectionRef.countDocuments(filter),
+    bookingsCollectionRef
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+  ]);
+
+  return {
+    bookings: bookings.map((booking) => toBookingResponse(booking)),
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  };
+}
+
+async function findBookingByIdAndCustomer(
+  database: Db,
+  bookingId: ObjectId,
+  customerId: string,
+): Promise<BookingDocument | null> {
+  return bookingsCollection(database).findOne({ _id: bookingId, customerId });
+}
+
+export async function cancelBooking(
+  database: Db,
+  bookingId: string,
+  customerId: string,
+): Promise<BookingResponse> {
+  const id = parseObjectId(bookingId, 'booking');
+
+  const updated = await bookingsCollection(database).findOneAndUpdate(
+    { _id: id, customerId, status: 'Pending' },
+    { $set: { status: 'Cancelled' } },
+    { returnDocument: 'after' },
+  );
+
+  if (updated) {
+    return toBookingResponse(updated as unknown as BookingDocument);
+  }
+
+  const existing = await findBookingByIdAndCustomer(database, id, customerId);
+  if (!existing) {
+    throw new AppError('Booking not found.', 404, true, 'BOOKING_NOT_FOUND');
+  }
+  throw new AppError('Only pending bookings can be cancelled.', 409, true, 'BOOKING_ALREADY_PROCESSED');
+}

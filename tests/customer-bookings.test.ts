@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ObjectId, type Db } from 'mongodb';
-import { createBookingSchema } from '../src/models/booking.js';
-import { createBooking } from '../src/services/booking.service.js';
+import {
+  createBookingSchema,
+  customerBookingQuerySchema,
+} from '../src/models/booking.js';
+import {
+  cancelBooking,
+  createBooking,
+  getCustomerBookings,
+} from '../src/services/booking.service.js';
 import { AppError } from '../src/utils/app-error.js';
 
 type MemoryDocument = Record<string, unknown> & { _id: string | ObjectId };
@@ -43,9 +50,56 @@ function createMemoryDatabase(overrides: {
         return {
           findOne: async (filter: Record<string, unknown>) =>
             bookings.find((booking) => matches(booking, filter)) ?? null,
+          find: (filter: Record<string, unknown>) => {
+            let result = bookings.filter((booking) => matches(booking, filter));
+            let sortField: string | null = null;
+            let sortOrder = 1;
+            const chain: Record<string, unknown> = {
+              sort: (spec: Record<string, unknown>) => {
+                const [field, order] = Object.entries(spec)[0];
+                sortField = field as string;
+                sortOrder = Number(order) === -1 ? -1 : 1;
+                return chain;
+              },
+              skip: (n: number) => {
+                result = result.slice(Number(n));
+                return chain;
+              },
+              limit: (n: number) => {
+                result = result.slice(0, Number(n));
+                return chain;
+              },
+              toArray: async () => {
+                if (sortField) {
+                  result = [...result].sort((a, b) => {
+                    const av = a[sortField as keyof MemoryDocument];
+                    const bv = b[sortField as keyof MemoryDocument];
+                    if (av instanceof Date && bv instanceof Date) {
+                      return sortOrder * (av.getTime() - bv.getTime());
+                    }
+                    return 0;
+                  });
+                }
+                return result;
+              },
+            };
+            return chain;
+          },
+          countDocuments: async (filter: Record<string, unknown>) =>
+            bookings.filter((booking) => matches(booking, filter)).length,
           insertOne: async (booking: MemoryDocument) => {
             bookings.push(booking);
             return { insertedId: booking._id };
+          },
+          findOneAndUpdate: async (
+            filter: Record<string, unknown>,
+            update: { $set: Record<string, unknown> },
+            options?: { returnDocument?: string },
+          ) => {
+            const booking = bookings.find((entry) => matches(entry, filter));
+            if (!booking) return null;
+            Object.assign(booking, update.$set);
+            return booking;
           },
         };
       }
@@ -489,5 +543,275 @@ test('rejects when vendor information cannot be resolved', async () => {
   await assert.rejects(
     () => createBooking(database, CUSTOMER_ID, { ...validInput, serviceId: service._id.toHexString() }),
     { statusCode: 404, code: 'VENDOR_NOT_FOUND' },
+  );
+});
+
+const OTHER_CUSTOMER_ID = '6b01311fbff14dc2fcc15479';
+
+function customerBookingRecord(
+  ownerId: string,
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    _id: new ObjectId(),
+    vendorId: VENDOR_ID,
+    customerId: ownerId,
+    serviceId: '6b01b9b8df51aa9a3daa485b',
+    eventDate: '2027-06-15',
+    eventLocation: 'Dhaka',
+    message: 'Test booking',
+    status: 'Pending',
+    createdAt: new Date(),
+    serviceSnapshot: {
+      serviceName: 'Wedding Photography',
+      category: 'Photography & Videography',
+      image: 'https://i.ibb.co/abc123/photo.jpg',
+      price: 1200,
+      vendor: { name: 'John Vendor', businessName: 'Johns Weddings' },
+    },
+    ...overrides,
+  };
+}
+
+test('customer booking list query schema accepts valid input', () => {
+  assert.equal(
+    customerBookingQuerySchema.safeParse({ status: 'Pending', page: '1', limit: '10' }).success,
+    true,
+  );
+  assert.equal(
+    customerBookingQuerySchema.safeParse({}).success,
+    true,
+  );
+});
+
+test('customer booking list query schema defaults page and limit', () => {
+  const result = customerBookingQuerySchema.safeParse({});
+  assert.equal(result.success, true);
+  if (result.success) {
+    assert.equal(result.data.page, 1);
+    assert.equal(result.data.limit, 10);
+  }
+});
+
+test('customer booking list query schema rejects invalid status', () => {
+  assert.equal(
+    customerBookingQuerySchema.safeParse({ status: 'Invalid' }).success,
+    false,
+  );
+});
+
+test('get customer bookings returns only bookings for the authenticated customer', async () => {
+  const ownBooking = customerBookingRecord(CUSTOMER_ID);
+  const otherBooking = customerBookingRecord(OTHER_CUSTOMER_ID, {
+    _id: new ObjectId(),
+  });
+  const { database } = createMemoryDatabase({
+    bookings: [ownBooking, otherBooking],
+    services: [],
+    users: [],
+  });
+
+  const result = await getCustomerBookings(database, {
+    customerId: CUSTOMER_ID,
+    page: 1,
+    limit: 10,
+  });
+
+  assert.equal(result.bookings.length, 1);
+  assert.equal(result.bookings[0]!.customerId, CUSTOMER_ID);
+  assert.equal(result.pagination.total, 1);
+});
+
+test('get customer bookings does not expose another customer bookings', async () => {
+  const otherBooking = customerBookingRecord(OTHER_CUSTOMER_ID);
+  const { database } = createMemoryDatabase({
+    bookings: [otherBooking],
+    services: [],
+    users: [],
+  });
+
+  const result = await getCustomerBookings(database, {
+    customerId: CUSTOMER_ID,
+    page: 1,
+    limit: 10,
+  });
+
+  assert.equal(result.bookings.length, 0);
+  assert.equal(result.pagination.total, 0);
+});
+
+test('get customer bookings filters by status', async () => {
+  const pendingBooking = customerBookingRecord(CUSTOMER_ID, { status: 'Pending' });
+  const acceptedBooking = customerBookingRecord(CUSTOMER_ID, {
+    _id: new ObjectId(),
+    status: 'Accepted',
+  });
+  const { database } = createMemoryDatabase({
+    bookings: [pendingBooking, acceptedBooking],
+    services: [],
+    users: [],
+  });
+
+  const result = await getCustomerBookings(database, {
+    customerId: CUSTOMER_ID,
+    status: 'Pending',
+    page: 1,
+    limit: 10,
+  });
+
+  assert.equal(result.bookings.length, 1);
+  assert.equal(result.bookings[0]!.status, 'Pending');
+});
+
+test('get customer bookings supports pagination', async () => {
+  const bookings = [
+    customerBookingRecord(CUSTOMER_ID),
+    customerBookingRecord(CUSTOMER_ID, { _id: new ObjectId() }),
+    customerBookingRecord(CUSTOMER_ID, { _id: new ObjectId() }),
+  ];
+  const { database } = createMemoryDatabase({
+    bookings,
+    services: [],
+    users: [],
+  });
+
+  const result = await getCustomerBookings(database, {
+    customerId: CUSTOMER_ID,
+    page: 1,
+    limit: 2,
+  });
+
+  assert.equal(result.bookings.length, 2);
+  assert.equal(result.pagination.page, 1);
+  assert.equal(result.pagination.limit, 2);
+  assert.equal(result.pagination.total, 3);
+  assert.equal(result.pagination.totalPages, 2);
+});
+
+test('get customer bookings sorts newest first', async () => {
+  const older = customerBookingRecord(CUSTOMER_ID, {
+    _id: new ObjectId(),
+    createdAt: new Date('2027-01-01'),
+  });
+  const newer = customerBookingRecord(CUSTOMER_ID, {
+    _id: new ObjectId(),
+    createdAt: new Date('2027-06-01'),
+  });
+  const { database } = createMemoryDatabase({
+    bookings: [older, newer],
+    services: [],
+    users: [],
+  });
+
+  const result = await getCustomerBookings(database, {
+    customerId: CUSTOMER_ID,
+    page: 1,
+    limit: 10,
+  });
+
+  assert.equal(result.bookings.length, 2);
+  assert.equal(result.bookings[0]!.createdAt.getTime(), newer.createdAt.getTime());
+});
+
+test('get customer bookings returns empty result when no bookings exist', async () => {
+  const { database } = createMemoryDatabase({ services: [], bookings: [], users: [] });
+
+  const result = await getCustomerBookings(database, {
+    customerId: CUSTOMER_ID,
+    page: 1,
+    limit: 10,
+  });
+
+  assert.equal(result.bookings.length, 0);
+  assert.equal(result.pagination.total, 0);
+  assert.equal(result.pagination.totalPages, 0);
+});
+
+test('cancel booking transitions Pending to Cancelled', async () => {
+  const booking = customerBookingRecord(CUSTOMER_ID);
+  const { database, bookings } = createMemoryDatabase({
+    bookings: [booking],
+    services: [],
+    users: [],
+  });
+
+  const result = await cancelBooking(database, booking._id.toHexString(), CUSTOMER_ID);
+
+  assert.equal(result.status, 'Cancelled');
+  assert.equal(result.id, booking._id.toHexString());
+  assert.equal(bookings[0]!.status, 'Cancelled');
+});
+
+test('cancel booking cancels only own booking', async () => {
+  const booking = customerBookingRecord(OTHER_CUSTOMER_ID);
+  const { database } = createMemoryDatabase({
+    bookings: [booking],
+    services: [],
+    users: [],
+  });
+
+  await assert.rejects(
+    () => cancelBooking(database, booking._id.toHexString(), CUSTOMER_ID),
+    { statusCode: 404, code: 'BOOKING_NOT_FOUND' },
+  );
+});
+
+test('cancel nonexistent booking returns 404', async () => {
+  const { database } = createMemoryDatabase({ services: [], bookings: [], users: [] });
+
+  await assert.rejects(
+    () => cancelBooking(database, new ObjectId().toHexString(), CUSTOMER_ID),
+    { statusCode: 404, code: 'BOOKING_NOT_FOUND' },
+  );
+});
+
+test('cancel already Accepted booking returns 409', async () => {
+  const booking = customerBookingRecord(CUSTOMER_ID, { status: 'Accepted' });
+  const { database } = createMemoryDatabase({
+    bookings: [booking],
+    services: [],
+    users: [],
+  });
+
+  await assert.rejects(
+    () => cancelBooking(database, booking._id.toHexString(), CUSTOMER_ID),
+    { statusCode: 409, code: 'BOOKING_ALREADY_PROCESSED' },
+  );
+});
+
+test('cancel already Rejected booking returns 409', async () => {
+  const booking = customerBookingRecord(CUSTOMER_ID, { status: 'Rejected' });
+  const { database } = createMemoryDatabase({
+    bookings: [booking],
+    services: [],
+    users: [],
+  });
+
+  await assert.rejects(
+    () => cancelBooking(database, booking._id.toHexString(), CUSTOMER_ID),
+    { statusCode: 409, code: 'BOOKING_ALREADY_PROCESSED' },
+  );
+});
+
+test('cancel already Cancelled booking returns 409', async () => {
+  const booking = customerBookingRecord(CUSTOMER_ID, { status: 'Cancelled' });
+  const { database } = createMemoryDatabase({
+    bookings: [booking],
+    services: [],
+    users: [],
+  });
+
+  await assert.rejects(
+    () => cancelBooking(database, booking._id.toHexString(), CUSTOMER_ID),
+    { statusCode: 409, code: 'BOOKING_ALREADY_PROCESSED' },
+  );
+});
+
+test('cancel invalid booking ID returns 400', async () => {
+  const { database } = createMemoryDatabase({ services: [], bookings: [], users: [] });
+
+  await assert.rejects(
+    () => cancelBooking(database, 'not-an-object-id', CUSTOMER_ID),
+    { statusCode: 400, code: 'INVALID_OBJECT_ID' },
   );
 });
