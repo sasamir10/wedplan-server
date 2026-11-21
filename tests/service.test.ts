@@ -15,8 +15,13 @@ import {
   updateVendorServiceAvailability,
   type ServiceDocument,
 } from '../src/services/service.service.js';
+import { AppError } from '../src/utils/app-error.js';
 
 type MemoryDocument = Record<string, unknown> & { _id: string | ObjectId };
+
+const vendorOneObjectId = new ObjectId();
+const VENDOR_ONE_ID = vendorOneObjectId.toHexString();
+const VENDOR_TWO_ID = new ObjectId().toHexString();
 
 function matches(document: MemoryDocument, filter: Record<string, unknown>): boolean {
   return Object.entries(filter).every(([key, value]) => {
@@ -29,7 +34,10 @@ function matches(document: MemoryDocument, filter: Record<string, unknown>): boo
 }
 
 function createMemoryDatabase(plan: 'free' | 'premium', initialServices: ServiceDocument[] = []) {
-  const users: MemoryDocument[] = [{ _id: 'vendor-1', subscriptionPlan: plan }];
+  // Better Auth stores user._id as an ObjectId; service vendorId stays a hex string.
+  const users: MemoryDocument[] = [
+    { _id: vendorOneObjectId, subscriptionPlan: plan },
+  ];
   const services = [...initialServices] as MemoryDocument[];
   let lockTail = Promise.resolve();
   let endedSessionCount = 0;
@@ -134,6 +142,7 @@ function createMemoryDatabase(plan: 'free' | 'premium', initialServices: Service
     database: database as unknown as Db,
     client: client as unknown as MongoClient,
     services,
+    users,
     getEndedSessionCount: () => endedSessionCount,
   };
 }
@@ -188,9 +197,9 @@ test('availability endpoint accepts only a boolean availability field', () => {
 
 test('creates Pending available service for the authenticated vendor', async () => {
   const { database, client, services } = createMemoryDatabase('free');
-  const service = await createService(database, client, 'vendor-1', { ...validInput });
+  const service = await createService(database, client, VENDOR_ONE_ID, { ...validInput });
 
-  assert.equal(service.vendorId, 'vendor-1');
+  assert.equal(service.vendorId, VENDOR_ONE_ID);
   assert.equal(service.status, 'Pending');
   assert.equal(service.availability, true);
   assert.equal(services.length, 1);
@@ -198,19 +207,19 @@ test('creates Pending available service for the authenticated vendor', async () 
 
 test('lists only services owned by the requested vendor', async () => {
   const { database } = createMemoryDatabase('free', [
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-2', true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_TWO_ID, true),
   ]);
 
-  const result = await getVendorServices(database, 'vendor-1');
+  const result = await getVendorServices(database, VENDOR_ONE_ID);
   assert.equal(result.length, 1);
-  assert.equal(result[0]?.vendorId, 'vendor-1');
+  assert.equal(result[0]?.vendorId, VENDOR_ONE_ID);
 });
 
 test('updates an owned service without allowing approval-field changes', async () => {
-  const ownedService = serviceRecord('vendor-1', true);
+  const ownedService = serviceRecord(VENDOR_ONE_ID, true);
   const { database } = createMemoryDatabase('free', [ownedService]);
-  const updated = await updateVendorService(database, 'vendor-1', ownedService._id.toHexString(), {
+  const updated = await updateVendorService(database, VENDOR_ONE_ID, ownedService._id.toHexString(), {
     serviceName: 'Updated wedding photography',
   });
 
@@ -219,17 +228,17 @@ test('updates an owned service without allowing approval-field changes', async (
 });
 
 test('cannot update or delete a service owned by another vendor', async () => {
-  const foreignService = serviceRecord('vendor-2', true);
+  const foreignService = serviceRecord(VENDOR_TWO_ID, true);
   const { database, client, services } = createMemoryDatabase('free', [foreignService]);
 
   await assert.rejects(
-    () => updateVendorService(database, 'vendor-1', foreignService._id.toHexString(), {
+    () => updateVendorService(database, VENDOR_ONE_ID, foreignService._id.toHexString(), {
       serviceName: 'Changed title',
     }),
     { statusCode: 404 },
   );
   await assert.rejects(
-    () => deleteVendorService(database, client, 'vendor-1', foreignService._id.toHexString()),
+    () => deleteVendorService(database, client, VENDOR_ONE_ID, foreignService._id.toHexString()),
     { statusCode: 404 },
   );
   assert.equal(services.length, 1);
@@ -238,7 +247,7 @@ test('cannot update or delete a service owned by another vendor', async () => {
 test('validates MongoDB service IDs before querying', async () => {
   const { database } = createMemoryDatabase('free');
   await assert.rejects(
-    () => updateVendorService(database, 'vendor-1', 'not-an-object-id', {
+    () => updateVendorService(database, VENDOR_ONE_ID, 'not-an-object-id', {
       serviceName: 'Changed title',
     }),
     { statusCode: 400 },
@@ -247,29 +256,29 @@ test('validates MongoDB service IDs before querying', async () => {
 
 test('blocks Free vendors from creating a fourth available service', async () => {
   const { database, client } = createMemoryDatabase('free', [
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
   ]);
 
   await assert.rejects(
-    () => createService(database, client, 'vendor-1', { ...validInput }),
-    { statusCode: 409 },
+    () => createService(database, client, VENDOR_ONE_ID, { ...validInput }),
+    { statusCode: 409, code: 'FREE_PLAN_LIMIT_REACHED' },
   );
 });
 
 test('counts Pending, Approved, and Rejected services when availability is true', async () => {
   const services = [
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
   ];
   services[1]!.status = 'Approved';
   services[2]!.status = 'Rejected';
   const { database, client } = createMemoryDatabase('free', services);
 
   await assert.rejects(
-    () => createService(database, client, 'vendor-1', { ...validInput }),
+    () => createService(database, client, VENDOR_ONE_ID, { ...validInput }),
     { statusCode: 409 },
   );
 });
@@ -278,7 +287,7 @@ test('concurrent Free vendor creation cannot exceed three active services', asyn
   const { database, client, services } = createMemoryDatabase('free');
   const results = await Promise.allSettled(
     Array.from({ length: 8 }, () =>
-      createService(database, client, 'vendor-1', { ...validInput }),
+      createService(database, client, VENDOR_ONE_ID, { ...validInput }),
     ),
   );
 
@@ -289,18 +298,18 @@ test('concurrent Free vendor creation cannot exceed three active services', asyn
 
 test('blocks Free vendor activation at the limit and permits it after deactivation', async () => {
   const active = [
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
   ];
-  const unavailable = serviceRecord('vendor-1', false);
+  const unavailable = serviceRecord(VENDOR_ONE_ID, false);
   const { database, client } = createMemoryDatabase('free', [...active, unavailable]);
 
   await assert.rejects(
     () => updateVendorServiceAvailability(
       database,
       client,
-      'vendor-1',
+      VENDOR_ONE_ID,
       unavailable._id.toHexString(),
       true,
     ),
@@ -310,14 +319,14 @@ test('blocks Free vendor activation at the limit and permits it after deactivati
   await updateVendorServiceAvailability(
     database,
     client,
-    'vendor-1',
+    VENDOR_ONE_ID,
     active[0]!._id.toHexString(),
     false,
   );
   const activated = await updateVendorServiceAvailability(
     database,
     client,
-    'vendor-1',
+    VENDOR_ONE_ID,
     unavailable._id.toHexString(),
     true,
   );
@@ -327,24 +336,24 @@ test('blocks Free vendor activation at the limit and permits it after deactivati
 
 test('deleting an owned available service frees a Free-plan active slot', async () => {
   const active = [
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
   ];
   const { database, client, services } = createMemoryDatabase('free', active);
 
-  await deleteVendorService(database, client, 'vendor-1', active[0]!._id.toHexString());
-  const created = await createService(database, client, 'vendor-1', { ...validInput });
+  await deleteVendorService(database, client, VENDOR_ONE_ID, active[0]!._id.toHexString());
+  const created = await createService(database, client, VENDOR_ONE_ID, { ...validInput });
 
   assert.equal(created.availability, true);
   assert.equal(services.filter((service) => service.availability).length, 3);
 });
 
 test('concurrent Free vendor activations allow only the remaining slot', async () => {
-  const unavailable = [serviceRecord('vendor-1', false), serviceRecord('vendor-1', false)];
+  const unavailable = [serviceRecord(VENDOR_ONE_ID, false), serviceRecord(VENDOR_ONE_ID, false)];
   const { database, client, services } = createMemoryDatabase('free', [
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
     ...unavailable,
   ]);
   const results = await Promise.allSettled(
@@ -352,7 +361,7 @@ test('concurrent Free vendor activations allow only the remaining slot', async (
       updateVendorServiceAvailability(
         database,
         client,
-        'vendor-1',
+        VENDOR_ONE_ID,
         service._id.toHexString(),
         true,
       ),
@@ -366,13 +375,13 @@ test('concurrent Free vendor activations allow only the remaining slot', async (
 
 test('closes the MongoDB session when a subscription limit aborts a transaction', async () => {
   const { database, client, getEndedSessionCount } = createMemoryDatabase('free', [
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
   ]);
 
   await assert.rejects(
-    () => createService(database, client, 'vendor-1', { ...validInput }),
+    () => createService(database, client, VENDOR_ONE_ID, { ...validInput }),
     { statusCode: 409 },
   );
   assert.equal(getEndedSessionCount(), 1);
@@ -380,12 +389,100 @@ test('closes the MongoDB session when a subscription limit aborts a transaction'
 
 test('Premium vendors are not subject to the Free active-service limit', async () => {
   const { database, client } = createMemoryDatabase('premium', [
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
-    serviceRecord('vendor-1', true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
+    serviceRecord(VENDOR_ONE_ID, true),
   ]);
 
-  const created = await createService(database, client, 'vendor-1', { ...validInput });
+  const created = await createService(database, client, VENDOR_ONE_ID, { ...validInput });
   assert.equal(created.availability, true);
+});
+
+test('resolves the ObjectId-backed vendor while storing vendorId as a hex string', async () => {
+  const { database, client, users } = createMemoryDatabase('free');
+  const created = await createService(database, client, VENDOR_ONE_ID, { ...validInput });
+
+  assert.ok(users[0]?._id instanceof ObjectId);
+  assert.equal(users[0]?._id.toHexString(), VENDOR_ONE_ID);
+  assert.equal(typeof created.vendorId, 'string');
+  assert.equal(created.vendorId, VENDOR_ONE_ID);
+  assert.equal(created.status, 'Pending');
+});
+
+test('rejects invalid vendor IDs without matching arbitrary strings', async () => {
+  const { database, client, services } = createMemoryDatabase('free');
+
+  await assert.rejects(
+    () => createService(database, client, 'not-an-object-id', { ...validInput }),
+    (error: unknown) =>
+      error instanceof AppError &&
+      error.statusCode === 403 &&
+      error.code === 'VENDOR_ACCOUNT_UNAVAILABLE',
+  );
+  assert.equal(services.length, 0);
+});
+
+test('rejects a valid ObjectId that does not belong to an existing vendor', async () => {
+  const { database, client, services } = createMemoryDatabase('free');
+
+  await assert.rejects(
+    () =>
+      createService(database, client, new ObjectId().toHexString(), {
+        ...validInput,
+      }),
+    (error: unknown) =>
+      error instanceof AppError &&
+      error.statusCode === 403 &&
+      error.code === 'VENDOR_ACCOUNT_UNAVAILABLE',
+  );
+  assert.equal(services.length, 0);
+});
+
+test('reports an unverifiable subscription plan separately from a missing vendor', async () => {
+  const { database, client, users } = createMemoryDatabase('free');
+  users[0]!.subscriptionPlan = 'trial';
+
+  await assert.rejects(
+    () => createService(database, client, VENDOR_ONE_ID, { ...validInput }),
+    (error: unknown) =>
+      error instanceof AppError &&
+      error.statusCode === 403 &&
+      error.code === 'SUBSCRIPTION_UNVERIFIED',
+  );
+});
+
+test('cannot change availability for a service owned by another vendor', async () => {
+  const foreignService = serviceRecord(VENDOR_TWO_ID, false);
+  const { database, client, services } = createMemoryDatabase('free', [
+    foreignService,
+  ]);
+
+  await assert.rejects(
+    () =>
+      updateVendorServiceAvailability(
+        database,
+        client,
+        VENDOR_ONE_ID,
+        foreignService._id.toHexString(),
+        true,
+      ),
+    { statusCode: 404, code: 'SERVICE_NOT_FOUND' },
+  );
+  assert.equal(services[0]?.availability, false);
+});
+
+test('missing services cannot be deleted', async () => {
+  const { database, client } = createMemoryDatabase('free');
+
+  await assert.rejects(
+    () =>
+      deleteVendorService(
+        database,
+        client,
+        VENDOR_ONE_ID,
+        new ObjectId().toHexString(),
+      ),
+    { statusCode: 404, code: 'SERVICE_NOT_FOUND' },
+  );
 });
 

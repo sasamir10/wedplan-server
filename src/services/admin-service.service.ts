@@ -8,10 +8,11 @@ import {
 import type { AdminServiceQuery } from '../models/admin-service.js';
 import type { ServiceCategory, ServiceStatus } from '../models/service.js';
 import { AppError } from '../utils/app-error.js';
+import { parseObjectId, toBetterAuthUserObjectId } from '../utils/object-id.js';
 import type { ServiceDocument } from './service.service.js';
 
 interface AdminVendorDocument extends Document {
-  _id: string;
+  _id: ObjectId;
   name?: string;
   businessName?: string;
 }
@@ -53,11 +54,7 @@ function serviceCollection(database: Db): Collection<ServiceDocument> {
 }
 
 function parseServiceId(value: string): ObjectId {
-  if (!/^[a-f\d]{24}$/i.test(value)) {
-    throw new AppError('Invalid service ID.', 400);
-  }
-
-  return new ObjectId(value);
+  return parseObjectId(value, 'service');
 }
 
 function escapeRegularExpression(value: string): string {
@@ -73,7 +70,7 @@ function toAdminServiceResponse(
     vendorId: service.vendorId,
     vendor: vendor
       ? {
-          id: vendor._id,
+          id: vendor._id.toHexString(),
           name: typeof vendor.name === 'string' ? vendor.name : null,
           businessName:
             typeof vendor.businessName === 'string' ? vendor.businessName : null,
@@ -119,14 +116,19 @@ export async function listAdminServices(
   ]);
 
   const vendorIds = [...new Set(services.map((service) => service.vendorId))];
-  const vendors: AdminVendorDocument[] = vendorIds.length
+  const vendorObjectIds = vendorIds
+    .map((vendorId) => toBetterAuthUserObjectId(vendorId))
+    .filter((vendorId): vendorId is ObjectId => vendorId !== null);
+  const vendors: AdminVendorDocument[] = vendorObjectIds.length
     ? await database
         .collection<AdminVendorDocument>('user')
-        .find({ _id: { $in: vendorIds } })
+        .find({ _id: { $in: vendorObjectIds } })
         .project<AdminVendorDocument>({ name: 1, businessName: 1 })
         .toArray()
     : [];
-  const vendorsById = new Map(vendors.map((vendor) => [vendor._id, vendor]));
+  const vendorsById = new Map(
+    vendors.map((vendor) => [vendor._id.toHexString(), vendor]),
+  );
 
   return {
     services: services.map((service) =>
@@ -169,12 +171,15 @@ async function updatePendingServiceStatus(
 
   if (!updated) {
     await assertServiceExists(database, id);
-    throw new AppError('Only pending services can be approved or rejected.', 409);
+    throw new AppError(
+      'Only pending services can be approved or rejected.',
+      409,
+      true,
+      'INVALID_SERVICE_STATUS',
+    );
   }
 
-  const vendor = await database
-    .collection<AdminVendorDocument>('user')
-    .findOne({ _id: updated.vendorId }, { projection: { name: 1, businessName: 1 } });
+  const vendor = await findVendorDisplay(database, updated.vendorId);
 
   return toAdminServiceResponse(updated, vendor ?? undefined);
 }
@@ -193,20 +198,39 @@ export async function updateAdminServiceStatus(
 
   if (!updated) {
     const existing = await serviceCollection(database).findOne({ _id: id });
-    if (!existing) throw new AppError('Service not found.', 404);
-    throw new AppError('Service already has the requested status.', 409);
+    if (!existing) throw new AppError('Service not found.', 404, true, 'SERVICE_NOT_FOUND');
+    throw new AppError(
+      'Service already has the requested status.',
+      409,
+      true,
+      'INVALID_SERVICE_STATUS',
+    );
   }
 
-  const vendor = await database
-    .collection<AdminVendorDocument>('user')
-    .findOne({ _id: updated.vendorId }, { projection: { name: 1, businessName: 1 } });
+  const vendor = await findVendorDisplay(database, updated.vendorId);
 
   return toAdminServiceResponse(updated, vendor ?? undefined);
 }
 
+async function findVendorDisplay(
+  database: Db,
+  vendorId: string,
+): Promise<AdminVendorDocument | null> {
+  const vendorObjectId = toBetterAuthUserObjectId(vendorId);
+
+  if (!vendorObjectId) return null;
+
+  return database
+    .collection<AdminVendorDocument>('user')
+    .findOne(
+      { _id: vendorObjectId },
+      { projection: { name: 1, businessName: 1 } },
+    );
+}
+
 async function assertServiceExists(database: Db, id: ObjectId): Promise<void> {
   const service = await serviceCollection(database).findOne({ _id: id });
-  if (!service) throw new AppError('Service not found.', 404);
+  if (!service) throw new AppError('Service not found.', 404, true, 'SERVICE_NOT_FOUND');
 }
 
 export async function deleteAdminService(
@@ -218,6 +242,6 @@ export async function deleteAdminService(
   });
 
   if (result.deletedCount !== 1) {
-    throw new AppError('Service not found.', 404);
+    throw new AppError('Service not found.', 404, true, 'SERVICE_NOT_FOUND');
   }
 }

@@ -68,7 +68,10 @@ test('allows a vendor on a vendor-only route', () => {
 });
 
 test('denies a customer on a vendor-only route', () => {
-  assertDenied(runAuthorization(['vendor']), 403);
+  const result = runAuthorization(['vendor']);
+  assertDenied(result, 403);
+  assert.ok(result.forwardedError instanceof AppError);
+  assert.equal(result.forwardedError.code, 'ROLE_FORBIDDEN');
 });
 
 test('denies a vendor on a customer-only route', () => {

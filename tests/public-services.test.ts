@@ -9,6 +9,10 @@ import { errorHandler } from '../src/middleware/error-handler.js';
 
 type MemoryRecord = Record<string, unknown>;
 
+// Better Auth stores user._id as an ObjectId while services.vendorId is a hex string.
+const vendorUserId = new ObjectId();
+const vendorId = vendorUserId.toHexString();
+
 function service(
   vendorId: string,
   status: ServiceDocument['status'],
@@ -36,6 +40,7 @@ function createDatabase(services: ServiceDocument[], users: MemoryRecord[] = [])
   let serviceLimit: number | undefined;
   let serviceSort: Record<string, 1 | -1> | undefined;
   let userProjection: Record<string, unknown> | undefined;
+  let userFilter: { _id: { $in: ObjectId[] } } | undefined;
 
   const database = {
     collection(name: string) {
@@ -92,7 +97,8 @@ function createDatabase(services: ServiceDocument[], users: MemoryRecord[] = [])
 
       if (name === 'user') {
         return {
-          find(filter: { _id: { $in: string[] } }) {
+          find(filter: { _id: { $in: ObjectId[] } }) {
+            userFilter = filter;
             return {
               project(projection: Record<string, unknown>) {
                 userProjection = projection;
@@ -100,7 +106,13 @@ function createDatabase(services: ServiceDocument[], users: MemoryRecord[] = [])
               },
               toArray: async () =>
                 users
-                  .filter((user) => filter._id.$in.includes(String(user._id)))
+                  .filter((user) =>
+                    filter._id.$in.some(
+                      (candidate) =>
+                        user._id instanceof ObjectId &&
+                        candidate.equals(user._id),
+                    ),
+                  )
                   .map((user) => ({
                     _id: user._id,
                     name: user.name,
@@ -121,6 +133,7 @@ function createDatabase(services: ServiceDocument[], users: MemoryRecord[] = [])
     getServiceLimit: () => serviceLimit,
     getServiceSort: () => serviceSort,
     getUserProjection: () => userProjection,
+    getUserFilter: () => userFilter,
   };
 }
 
@@ -149,17 +162,17 @@ async function withPublicServicesServer<T>(
 }
 
 test('public services are unauthenticated and include approved active services with safe vendor display fields', async () => {
-  const visible = service('vendor-1', 'Approved', true);
+  const visible = service(vendorId, 'Approved', true);
   const database = createDatabase(
     [
       visible,
-      service('vendor-1', 'Pending', true),
-      service('vendor-1', 'Rejected', true),
-      service('vendor-1', 'Approved', false),
+      service(vendorId, 'Pending', true),
+      service(vendorId, 'Rejected', true),
+      service(vendorId, 'Approved', false),
     ],
     [
       {
-        _id: 'vendor-1',
+        _id: vendorUserId,
         name: 'Ayesha Rahman',
         businessName: 'Ayesha Photography',
         email: 'private@example.com',
@@ -191,10 +204,15 @@ test('public services are unauthenticated and include approved active services w
 
   assert.deepEqual(database.getServiceFilter(), { status: 'Approved', availability: true });
   assert.deepEqual(database.getUserProjection(), { name: 1, businessName: 1 });
+
+  const convertedIds = database.getUserFilter()?._id.$in ?? [];
+  assert.equal(convertedIds.length, 1);
+  assert.ok(convertedIds[0] instanceof ObjectId);
+  assert.equal(convertedIds[0].toHexString(), vendorId);
 });
 
 test('public services returns an empty list when no approved active services exist', async () => {
-  const database = createDatabase([service('vendor-1', 'Pending', true)]);
+  const database = createDatabase([service(vendorId, 'Pending', true)]);
 
   await withPublicServicesServer(database.database, async (baseUrl) => {
     const response = await fetch(`${baseUrl}/api/services`);
@@ -204,7 +222,8 @@ test('public services returns an empty list when no approved active services exi
 });
 
 test('public services represents a missing vendor record without failing or exposing internals', async () => {
-  const database = createDatabase([service('deleted-vendor', 'Approved', true)]);
+  const deletedVendorId = new ObjectId().toHexString();
+  const database = createDatabase([service(deletedVendorId, 'Approved', true)]);
 
   await withPublicServicesServer(database.database, async (baseUrl) => {
     const response = await fetch(`${baseUrl}/api/services`);
@@ -214,17 +233,66 @@ test('public services represents a missing vendor record without failing or expo
     };
     assert.equal(payload.services[0]?.vendor, null);
   });
+
+  const convertedIds = database.getUserFilter()?._id.$in ?? [];
+  assert.equal(convertedIds.length, 1);
+  assert.equal(convertedIds[0]?.toHexString(), deletedVendorId);
+});
+
+test('public services batches ObjectId lookups for multiple vendors', async () => {
+  const secondVendorObjectId = new ObjectId();
+  const firstService = service(vendorId, 'Approved', true);
+  const secondService = service(secondVendorObjectId.toHexString(), 'Approved', true);
+  const database = createDatabase([firstService, secondService], [
+    {
+      _id: vendorUserId,
+      name: 'Ayesha Rahman',
+      businessName: 'Ayesha Photography',
+    },
+    {
+      _id: secondVendorObjectId,
+      name: 'Nabil Hasan',
+      businessName: 'Nabil Films',
+    },
+  ]);
+
+  await withPublicServicesServer(database.database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/services`);
+    assert.equal(response.status, 200);
+    const payload = (await response.json()) as {
+      services: Array<{
+        id: string;
+        vendor: { name: string | null; businessName: string | null } | null;
+      }>;
+    };
+    const vendorsByServiceId = new Map(
+      payload.services.map((item) => [item.id, item.vendor]),
+    );
+
+    assert.deepEqual(vendorsByServiceId.get(firstService._id.toHexString()), {
+      name: 'Ayesha Rahman',
+      businessName: 'Ayesha Photography',
+    });
+    assert.deepEqual(vendorsByServiceId.get(secondService._id.toHexString()), {
+      name: 'Nabil Hasan',
+      businessName: 'Nabil Films',
+    });
+  });
+
+  const convertedIds = database.getUserFilter()?._id.$in ?? [];
+  assert.equal(convertedIds.length, 2);
+  assert.ok(convertedIds.every((id) => id instanceof ObjectId));
 });
 
 test('public search performs case-insensitive partial matching on service names', async () => {
-  const match = service('vendor-1', 'Approved', true);
+  const match = service(vendorId, 'Approved', true);
   match.serviceName = 'Wedding Photography Package';
-  const nonMatch = service('vendor-1', 'Approved', true);
+  const nonMatch = service(vendorId, 'Approved', true);
   nonMatch.serviceName = 'Wedding Venue';
   const database = createDatabase([
     match,
     nonMatch,
-    service('vendor-1', 'Pending', true),
+    service(vendorId, 'Pending', true),
   ]);
 
   await withPublicServicesServer(database.database, async (baseUrl) => {
@@ -236,9 +304,9 @@ test('public search performs case-insensitive partial matching on service names'
 });
 
 test('public category filtering matches an existing category exactly', async () => {
-  const venue = service('vendor-1', 'Approved', true);
+  const venue = service(vendorId, 'Approved', true);
   venue.category = 'Wedding Venues';
-  const photography = service('vendor-1', 'Approved', true);
+  const photography = service(vendorId, 'Approved', true);
   const database = createDatabase([venue, photography]);
   const query = new URLSearchParams({ category: 'Wedding Venues' });
 
@@ -251,9 +319,9 @@ test('public category filtering matches an existing category exactly', async () 
 });
 
 test('public location filtering performs case-insensitive partial matching', async () => {
-  const match = service('vendor-1', 'Approved', true);
+  const match = service(vendorId, 'Approved', true);
   match.location = 'Central Sylhet District';
-  const database = createDatabase([match, service('vendor-1', 'Approved', true)]);
+  const database = createDatabase([match, service(vendorId, 'Approved', true)]);
 
   await withPublicServicesServer(database.database, async (baseUrl) => {
     const response = await fetch(`${baseUrl}/api/services?location=sYLh`);
@@ -264,23 +332,23 @@ test('public location filtering performs case-insensitive partial matching', asy
 });
 
 test('public search, category, and location filters combine using AND behavior', async () => {
-  const matching = service('vendor-1', 'Approved', true);
+  const matching = service(vendorId, 'Approved', true);
   matching.serviceName = 'Wedding Photography Package';
   matching.location = 'North Dhaka';
-  const wrongCategory = service('vendor-1', 'Approved', true);
+  const wrongCategory = service(vendorId, 'Approved', true);
   wrongCategory.serviceName = matching.serviceName;
   wrongCategory.location = matching.location;
   wrongCategory.category = 'Wedding Venues';
-  const wrongLocation = service('vendor-1', 'Approved', true);
+  const wrongLocation = service(vendorId, 'Approved', true);
   wrongLocation.serviceName = matching.serviceName;
   wrongLocation.location = 'Chattogram';
-  const wrongName = service('vendor-1', 'Approved', true);
+  const wrongName = service(vendorId, 'Approved', true);
   wrongName.serviceName = 'Wedding Celebration';
   wrongName.location = matching.location;
-  const unpublished = service('vendor-1', 'Pending', true);
+  const unpublished = service(vendorId, 'Pending', true);
   unpublished.serviceName = matching.serviceName;
   unpublished.location = matching.location;
-  const inactive = service('vendor-1', 'Approved', false);
+  const inactive = service(vendorId, 'Approved', false);
   inactive.serviceName = matching.serviceName;
   inactive.location = matching.location;
   const database = createDatabase([
@@ -306,8 +374,8 @@ test('public search, category, and location filters combine using AND behavior',
 });
 
 test('empty text filters are ignored and regex metacharacters are treated literally', async () => {
-  const eligible = service('vendor-1', 'Approved', true);
-  const database = createDatabase([eligible, service('vendor-1', 'Pending', true)]);
+  const eligible = service(vendorId, 'Approved', true);
+  const database = createDatabase([eligible, service(vendorId, 'Pending', true)]);
 
   await withPublicServicesServer(database.database, async (baseUrl) => {
     const unfiltered = await fetch(`${baseUrl}/api/services?search=%20%20&location=%20`);
@@ -331,8 +399,8 @@ test('unsupported public service categories return a validation error', async ()
 });
 
 test('default public service ordering remains newest first', async () => {
-  const older = service('vendor-1', 'Approved', true, new Date('2026-11-19T00:00:00Z'));
-  const newer = service('vendor-1', 'Approved', true, new Date('2026-11-20T00:00:00Z'));
+  const older = service(vendorId, 'Approved', true, new Date('2026-11-19T00:00:00Z'));
+  const newer = service(vendorId, 'Approved', true, new Date('2026-11-20T00:00:00Z'));
   const database = createDatabase([older, newer]);
 
   await withPublicServicesServer(database.database, async (baseUrl) => {
@@ -355,7 +423,7 @@ test('default public service ordering remains newest first', async () => {
 test('public price sorting uses numeric ascending and descending order', async () => {
   const prices = [5000, 12000, 25000, 50000];
   const services = prices.map((price) => ({
-    ...service('vendor-1', 'Approved', true),
+    ...service(vendorId, 'Approved', true),
     price,
   }));
   const database = createDatabase(services);
@@ -390,9 +458,9 @@ test('public price sorting uses numeric ascending and descending order', async (
 });
 
 test('equal public prices use newest date and ID as deterministic tie-breakers', async () => {
-  const oldest = service('vendor-1', 'Approved', true, new Date('2026-11-19T00:00:00Z'));
-  const latest = service('vendor-1', 'Approved', true, new Date('2026-11-21T00:00:00Z'));
-  const sameDateLaterId = service('vendor-1', 'Approved', true, latest.createdAt);
+  const oldest = service(vendorId, 'Approved', true, new Date('2026-11-19T00:00:00Z'));
+  const latest = service(vendorId, 'Approved', true, new Date('2026-11-21T00:00:00Z'));
+  const sameDateLaterId = service(vendorId, 'Approved', true, latest.createdAt);
   for (const item of [oldest, latest, sameDateLaterId]) item.price = 12000;
   const database = createDatabase([oldest, latest, sameDateLaterId]);
 
@@ -408,24 +476,24 @@ test('equal public prices use newest date and ID as deterministic tie-breakers',
 });
 
 test('price sorting combines with search, category, and location filters', async () => {
-  const lowerPrice = service('vendor-1', 'Approved', true);
+  const lowerPrice = service(vendorId, 'Approved', true);
   lowerPrice.serviceName = 'Wedding Photography Basic';
   lowerPrice.location = 'Dhaka North';
   lowerPrice.price = 12000;
-  const higherPrice = service('vendor-1', 'Approved', true);
+  const higherPrice = service(vendorId, 'Approved', true);
   higherPrice.serviceName = 'Wedding Photography Premium';
   higherPrice.location = 'Dhaka South';
   higherPrice.price = 25000;
-  const wrongCategory = service('vendor-1', 'Approved', true);
+  const wrongCategory = service(vendorId, 'Approved', true);
   wrongCategory.serviceName = 'Wedding Photography Venue';
   wrongCategory.location = 'Dhaka';
   wrongCategory.category = 'Wedding Venues';
   wrongCategory.price = 5000;
-  const inactive = service('vendor-1', 'Approved', false);
+  const inactive = service(vendorId, 'Approved', false);
   inactive.serviceName = 'Wedding Photography inactive';
   inactive.location = 'Dhaka';
   inactive.price = 5000;
-  const unpublished = service('vendor-1', 'Pending', true);
+  const unpublished = service(vendorId, 'Pending', true);
   unpublished.serviceName = 'Wedding Photography pending';
   unpublished.location = 'Dhaka';
   unpublished.price = 5000;
@@ -468,18 +536,20 @@ test('unsupported public price sort values return a validation error', async () 
 test('featured endpoint returns no more than six newest approved active services', async () => {
   const services = Array.from({ length: 8 }, (_, index) =>
     service(
-      'vendor-1',
+      vendorId,
       'Approved',
       true,
       new Date(`2026-11-${String(index + 1).padStart(2, '0')}T00:00:00.000Z`),
     ),
   );
   services.push(
-    service('vendor-1', 'Pending', true),
-    service('vendor-1', 'Rejected', true),
-    service('vendor-1', 'Approved', false),
+    service(vendorId, 'Pending', true),
+    service(vendorId, 'Rejected', true),
+    service(vendorId, 'Approved', false),
   );
-  const database = createDatabase(services, [{ _id: 'vendor-1', name: 'Vendor' }]);
+  const database = createDatabase(services, [
+    { _id: vendorUserId, name: 'Vendor' },
+  ]);
 
   await withPublicServicesServer(database.database, async (baseUrl) => {
     const response = await fetch(`${baseUrl}/api/services/featured`);
@@ -502,7 +572,7 @@ test('featured endpoint returns no more than six newest approved active services
 });
 
 test('featured endpoint returns fewer than six services and handles the empty state', async () => {
-  const database = createDatabase([service('vendor-1', 'Approved', true)]);
+  const database = createDatabase([service(vendorId, 'Approved', true)]);
 
   await withPublicServicesServer(database.database, async (baseUrl) => {
     const response = await fetch(`${baseUrl}/api/services/featured`);

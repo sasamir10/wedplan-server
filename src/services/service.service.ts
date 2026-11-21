@@ -13,6 +13,7 @@ import type {
   UpdateServiceInput,
 } from '../models/service.js';
 import { AppError } from '../utils/app-error.js';
+import { parseObjectId, toBetterAuthUserObjectId } from '../utils/object-id.js';
 
 export interface ServiceDocument extends Document {
   _id: ObjectId;
@@ -30,7 +31,7 @@ export interface ServiceDocument extends Document {
 }
 
 interface VendorDocument extends Document {
-  _id: string;
+  _id: ObjectId;
   subscriptionPlan?: unknown;
 }
 
@@ -73,11 +74,7 @@ function toServiceResponse(service: ServiceDocument): ServiceResponse {
 }
 
 function parseServiceId(value: string): ObjectId {
-  if (!/^[a-f\d]{24}$/i.test(value)) {
-    throw new AppError('Invalid service ID.', 400);
-  }
-
-  return new ObjectId(value);
+  return parseObjectId(value, 'service');
 }
 
 async function assertVendorPlan(
@@ -85,13 +82,38 @@ async function assertVendorPlan(
   vendorId: string,
   session?: ClientSession,
 ): Promise<'free' | 'premium'> {
-  // Better Auth's default MongoDB model name is "user"; IDs are stored as strings.
+  // Better Auth's default MongoDB model name is "user"; its _id is an ObjectId.
+  const vendorObjectId = toBetterAuthUserObjectId(vendorId);
+
+  if (!vendorObjectId) {
+    throw new AppError(
+      'Vendor subscription could not be verified.',
+      403,
+      true,
+      'VENDOR_NOT_FOUND',
+    );
+  }
+
   const vendor = await database
     .collection<VendorDocument>('user')
-    .findOne({ _id: vendorId }, { session });
+    .findOne({ _id: vendorObjectId }, { session });
 
-  if (!vendor || (vendor.subscriptionPlan !== 'free' && vendor.subscriptionPlan !== 'premium')) {
-    throw new AppError('Vendor subscription could not be verified.', 403);
+  if (!vendor) {
+    throw new AppError(
+      'Vendor subscription could not be verified.',
+      403,
+      true,
+      'VENDOR_NOT_FOUND',
+    );
+  }
+
+  if (vendor.subscriptionPlan !== 'free' && vendor.subscriptionPlan !== 'premium') {
+    throw new AppError(
+      'Vendor subscription could not be verified.',
+      403,
+      true,
+      'SUBSCRIPTION_UNVERIFIED',
+    );
   }
 
   return vendor.subscriptionPlan;
@@ -102,15 +124,31 @@ async function lockVendorServiceChanges(
   vendorId: string,
   session: ClientSession,
 ): Promise<void> {
+  const vendorObjectId = toBetterAuthUserObjectId(vendorId);
+
+  if (!vendorObjectId) {
+    throw new AppError(
+      'Vendor account is unavailable.',
+      403,
+      true,
+      'VENDOR_ACCOUNT_UNAVAILABLE',
+    );
+  }
+
   // A per-vendor write inside the transaction serializes limit-sensitive changes across API instances.
   const result = await database.collection<VendorDocument>('user').updateOne(
-    { _id: vendorId },
+    { _id: vendorObjectId },
     { $inc: { serviceMutationVersion: 1 } },
     { session },
   );
 
   if (result.matchedCount !== 1) {
-    throw new AppError('Vendor account is unavailable.', 403);
+    throw new AppError(
+      'Vendor account is unavailable.',
+      403,
+      true,
+      'VENDOR_ACCOUNT_UNAVAILABLE',
+    );
   }
 }
 
@@ -152,6 +190,8 @@ export function createService(
         throw new AppError(
           'The Free plan allows up to 3 active services. Upgrade or deactivate a service to continue.',
           409,
+          true,
+          'FREE_PLAN_LIMIT_REACHED',
         );
       }
     }
@@ -198,7 +238,7 @@ export async function updateVendorService(
   );
 
   if (!updated) {
-    throw new AppError('Service not found.', 404);
+    throw new AppError('Service not found.', 404, true, 'SERVICE_NOT_FOUND');
   }
 
   return toServiceResponse(updated);
@@ -219,7 +259,7 @@ export async function deleteVendorService(
     );
 
     if (result.deletedCount !== 1) {
-      throw new AppError('Service not found.', 404);
+      throw new AppError('Service not found.', 404, true, 'SERVICE_NOT_FOUND');
     }
   });
 }
@@ -238,7 +278,7 @@ export function updateVendorServiceAvailability(
     const service = await services.findOne({ _id: objectId, vendorId }, { session });
 
     if (!service) {
-      throw new AppError('Service not found.', 404);
+      throw new AppError('Service not found.', 404, true, 'SERVICE_NOT_FOUND');
     }
 
     if (availability && !service.availability) {
@@ -266,7 +306,7 @@ export function updateVendorServiceAvailability(
     );
 
     if (!updated) {
-      throw new AppError('Service not found.', 404);
+      throw new AppError('Service not found.', 404, true, 'SERVICE_NOT_FOUND');
     }
 
     return toServiceResponse(updated);

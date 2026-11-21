@@ -24,6 +24,7 @@ export const errorHandler: ErrorRequestHandler = (error: unknown, _request, resp
     success: false,
     error: {
       message,
+      ...(appError?.code ? { code: appError.code } : {}),
       ...(env.NODE_ENV !== 'production' && appError ? { stack: appError.stack } : {}),
     },
   });

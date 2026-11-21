@@ -1,10 +1,11 @@
-import type { Db, Document, Filter } from 'mongodb';
+import type { Db, Document, Filter, ObjectId } from 'mongodb';
 import type { PublicServiceQuery } from '../models/public-service.js';
 import type { ServiceCategory } from '../models/service.js';
+import { toBetterAuthUserObjectId } from '../utils/object-id.js';
 import type { ServiceDocument } from './service.service.js';
 
 interface PublicVendorDocument extends Document {
-  _id: string;
+  _id: ObjectId;
   name?: unknown;
   businessName?: unknown;
 }
@@ -106,12 +107,19 @@ async function readPublicServices(
   }
 
   const vendorIds = [...new Set(serviceDocuments.map((service) => service.vendorId))];
-  const vendors = await database
-    .collection<PublicVendorDocument>('user')
-    .find({ _id: { $in: vendorIds } })
-    .project<PublicVendorDocument>({ name: 1, businessName: 1 })
-    .toArray();
-  const vendorsById = new Map(vendors.map((vendor) => [vendor._id, vendor]));
+  const vendorObjectIds = vendorIds
+    .map((vendorId) => toBetterAuthUserObjectId(vendorId))
+    .filter((vendorId): vendorId is ObjectId => vendorId !== null);
+  const vendors = vendorObjectIds.length
+    ? await database
+        .collection<PublicVendorDocument>('user')
+        .find({ _id: { $in: vendorObjectIds } })
+        .project<PublicVendorDocument>({ name: 1, businessName: 1 })
+        .toArray()
+    : [];
+  const vendorsById = new Map(
+    vendors.map((vendor) => [vendor._id.toHexString(), vendor]),
+  );
 
   return serviceDocuments.map((service) => {
     const vendor = vendorsById.get(service.vendorId);

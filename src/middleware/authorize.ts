@@ -10,7 +10,9 @@ export function authorizeRoles(
     const authenticatedUser = request.authenticatedUser;
 
     if (!authenticatedUser) {
-      return next(new AppError('Authentication required.', 401));
+      return next(
+        new AppError('Authentication required.', 401, true, 'AUTHENTICATION_REQUIRED'),
+      );
     }
 
     const role: unknown = authenticatedUser.role;
@@ -19,7 +21,14 @@ export function authorizeRoles(
       typeof role !== 'string' ||
       !allowedRoles.some((allowedRole) => allowedRole === role)
     ) {
-      return next(new AppError('You are not authorized to access this resource.', 403));
+      return next(
+        new AppError(
+          'You are not authorized to access this resource.',
+          403,
+          true,
+          'ROLE_FORBIDDEN',
+        ),
+      );
     }
 
     return next();

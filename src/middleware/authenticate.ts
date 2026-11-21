@@ -66,7 +66,9 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
   const token = match?.[1];
 
   if (!token) {
-    return next(new AppError('Authentication required.', 401));
+    return next(
+      new AppError('Authentication required.', 401, true, 'AUTHENTICATION_REQUIRED'),
+    );
   }
 
   try {
@@ -83,7 +85,9 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
     }
 
     if (payload.isBlocked) {
-      return next(new AppError('Account access is unavailable.', 403));
+      return next(
+        new AppError('Account access is unavailable.', 403, true, 'ACCOUNT_BLOCKED'),
+      );
     }
 
     request.authenticatedUser = {

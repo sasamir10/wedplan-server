@@ -18,6 +18,12 @@ import { AppError } from '../src/utils/app-error.js';
 
 type MemoryRecord = Record<string, unknown> & { _id: string | ObjectId };
 
+// Better Auth stores user._id as an ObjectId while services.vendorId is a hex string.
+const vendorOneObjectId = new ObjectId();
+const VENDOR_ONE_ID = vendorOneObjectId.toHexString();
+const vendorTwoObjectId = new ObjectId();
+const VENDOR_TWO_ID = vendorTwoObjectId.toHexString();
+
 function matches(record: MemoryRecord, filter: Record<string, unknown>): boolean {
   return Object.entries(filter).every(([key, expected]) => {
     const actual = record[key];
@@ -27,7 +33,14 @@ function matches(record: MemoryRecord, filter: Record<string, unknown>): boolean
     if (typeof expected === 'object' && expected !== null) {
       const operators = expected as Record<string, unknown>;
       if ('$in' in operators) {
-        return Array.isArray(operators.$in) && operators.$in.includes(actual);
+        return (
+          Array.isArray(operators.$in) &&
+          operators.$in.some((candidate) =>
+            candidate instanceof ObjectId && actual instanceof ObjectId
+              ? candidate.equals(actual)
+              : candidate === actual,
+          )
+        );
       }
       if ('$ne' in operators) return actual !== operators.$ne;
       if ('$regex' in operators) {
@@ -67,8 +80,18 @@ function createService(
 function createDatabase(initial: ServiceDocument[] = []) {
   const services = [...initial] as MemoryRecord[];
   const users: MemoryRecord[] = [
-    { _id: 'vendor-1', name: 'Ayesha Rahman', businessName: 'Ayesha Photography', email: 'private@example.com' },
-    { _id: 'vendor-2', name: 'Nabil Hasan', businessName: 'Nabil Films', email: 'private2@example.com' },
+    {
+      _id: vendorOneObjectId,
+      name: 'Ayesha Rahman',
+      businessName: 'Ayesha Photography',
+      email: 'private@example.com',
+    },
+    {
+      _id: vendorTwoObjectId,
+      name: 'Nabil Hasan',
+      businessName: 'Nabil Films',
+      email: 'private2@example.com',
+    },
   ];
 
   const database = {
@@ -154,19 +177,20 @@ test('admin service query validates filters and applies safe pagination defaults
 });
 
 test('admin listing spans vendors, filters services, paginates, and returns limited vendor fields', async () => {
-  const first = createService('vendor-1', 'Ayesha Photo. Studio');
-  const second = createService('vendor-2', 'Nabil Wedding Films', {
+  const first = createService(VENDOR_ONE_ID, 'Ayesha Photo. Studio');
+  const second = createService(VENDOR_TWO_ID, 'Nabil Wedding Films', {
     status: 'Approved',
     availability: false,
     category: 'Wedding Fashion',
   });
-  const third = createService('vendor-2', 'Nabil Photo Booth');
+  const third = createService(VENDOR_TWO_ID, 'Nabil Photo Booth');
   const { database } = createDatabase([first, second, third]);
 
   const all = await listAdminServices(database, adminServiceQuerySchema.parse({ page: '1', limit: '2' }));
   assert.equal(all.pagination.total, 3);
   assert.equal(all.pagination.totalPages, 2);
   assert.equal(all.services.length, 2);
+  assert.equal(all.services[0]?.vendor?.id, VENDOR_ONE_ID);
   assert.equal(all.services[0]?.vendor?.businessName, 'Ayesha Photography');
   assert.equal('email' in (all.services[0]?.vendor ?? {}), false);
 
@@ -208,18 +232,45 @@ test('admin listing spans vendors, filters services, paginates, and returns limi
 });
 
 test('approves pending service atomically without changing ownership or availability', async () => {
-  const pending = createService('vendor-1', 'Ayesha Photo Studio', { availability: false });
+  const pending = createService(VENDOR_ONE_ID, 'Ayesha Photo Studio', { availability: false });
   const { database } = createDatabase([pending]);
   const updated = await approvePendingService(database, pending._id.toHexString());
 
   assert.equal(updated.status, 'Approved');
-  assert.equal(updated.vendorId, 'vendor-1');
+  assert.equal(updated.vendorId, VENDOR_ONE_ID);
   assert.equal(updated.availability, false);
+  assert.equal(updated.vendor?.id, VENDOR_ONE_ID);
+  assert.equal(updated.vendor?.businessName, 'Ayesha Photography');
   assert.ok(updated.updatedAt.getTime() >= pending.createdAt.getTime());
 });
 
+test('admin moderation returns a null vendor when the referenced user is missing', async () => {
+  const orphan = createService(
+    new ObjectId().toHexString(),
+    'Service With Missing Vendor',
+  );
+  const { database } = createDatabase([orphan]);
+  const updated = await approvePendingService(database, orphan._id.toHexString());
+
+  assert.equal(updated.status, 'Approved');
+  assert.equal(updated.vendor, null);
+});
+
+test('admin listing tolerates a malformed vendorId without querying arbitrary strings', async () => {
+  const legacy = createService('legacy-vendor-string', 'Legacy Service');
+  const { database } = createDatabase([legacy]);
+  const page = await listAdminServices(
+    database,
+    adminServiceQuerySchema.parse({}),
+  );
+
+  assert.equal(page.services.length, 1);
+  assert.equal(page.services[0]?.vendorId, 'legacy-vendor-string');
+  assert.equal(page.services[0]?.vendor, null);
+});
+
 test('rejects pending service and prevents repeated review transitions', async () => {
-  const pending = createService('vendor-1', 'Ayesha Photo Studio');
+  const pending = createService(VENDOR_ONE_ID, 'Ayesha Photo Studio');
   const { database } = createDatabase([pending]);
   const rejected = await rejectPendingService(database, pending._id.toHexString());
   assert.equal(rejected.status, 'Rejected');
@@ -231,7 +282,7 @@ test('rejects pending service and prevents repeated review transitions', async (
 });
 
 test('admin status changes allow supported transitions and preserve availability and ownership', async () => {
-  const approved = createService('vendor-2', 'Nabil Wedding Films', {
+  const approved = createService(VENDOR_TWO_ID, 'Nabil Wedding Films', {
     status: 'Approved',
     availability: false,
   });
@@ -243,7 +294,7 @@ test('admin status changes allow supported transitions and preserve availability
   );
 
   assert.equal(updated.status, 'Rejected');
-  assert.equal(updated.vendorId, 'vendor-2');
+  assert.equal(updated.vendorId, VENDOR_TWO_ID);
   assert.equal(updated.availability, false);
   assert.equal(adminServiceStatusSchema.safeParse({ status: 'Removed' }).success, false);
   assert.equal(
@@ -268,7 +319,7 @@ test('rejects invalid and missing service IDs without querying arbitrary IDs', a
 });
 
 test('admin can delete an existing service and missing service returns 404', async () => {
-  const service = createService('vendor-1', 'Ayesha Photo Studio');
+  const service = createService(VENDOR_ONE_ID, 'Ayesha Photo Studio');
   const { database, services } = createDatabase([service]);
 
   await deleteAdminService(database, service._id.toHexString());
