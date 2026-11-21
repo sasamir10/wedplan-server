@@ -2,6 +2,7 @@ import { Router, type Request } from 'express';
 import type { Db } from 'mongodb';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorizeRoles } from '../middleware/authorize.js';
+import { enforceBlockStatus } from '../middleware/block-status.js';
 import { receiveImageUpload } from '../middleware/image-upload.js';
 import { env } from '../config/env.js';
 import { getProfile, updateProfile } from '../services/profile.service.js';
@@ -21,7 +22,7 @@ function requireUserId(request: Request): string {
 export function createProfileRouter(database: Db) {
   const router = Router();
 
-  router.use(authenticate, authorizeRoles('customer', 'vendor'));
+  router.use(authenticate, authorizeRoles('customer', 'vendor'), enforceBlockStatus(database));
 
   router.get('/', async (request, response) => {
     const profile = await getProfile(database, requireUserId(request));

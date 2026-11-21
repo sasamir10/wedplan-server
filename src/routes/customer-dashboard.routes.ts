@@ -2,6 +2,7 @@ import { Router, type Request } from 'express';
 import type { Db } from 'mongodb';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorizeRoles } from '../middleware/authorize.js';
+import { enforceBlockStatus } from '../middleware/block-status.js';
 import { getCustomerStats } from '../services/customer-dashboard.service.js';
 import { AppError } from '../utils/app-error.js';
 
@@ -18,7 +19,7 @@ function requireCustomerId(request: Request): string {
 export function createCustomerDashboardRouter(database: Db) {
   const router = Router();
 
-  router.use(authenticate, authorizeRoles('customer'));
+  router.use(authenticate, authorizeRoles('customer'), enforceBlockStatus(database));
 
   router.get('/dashboard/stats', async (request, response) => {
     const stats = await getCustomerStats(

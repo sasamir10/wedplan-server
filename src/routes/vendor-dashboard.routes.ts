@@ -2,6 +2,7 @@ import { Router, type Request } from 'express';
 import type { Db } from 'mongodb';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorizeRoles } from '../middleware/authorize.js';
+import { enforceBlockStatus } from '../middleware/block-status.js';
 import { getVendorStats } from '../services/vendor-dashboard.service.js';
 import { AppError } from '../utils/app-error.js';
 
@@ -18,7 +19,7 @@ function requireVendorId(request: Request): string {
 export function createVendorDashboardRouter(database: Db) {
   const router = Router();
 
-  router.use(authenticate, authorizeRoles('vendor'));
+  router.use(authenticate, authorizeRoles('vendor'), enforceBlockStatus(database));
 
   router.get('/dashboard/stats', async (request, response) => {
     const stats = await getVendorStats(database, requireVendorId(request));

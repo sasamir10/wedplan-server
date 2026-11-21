@@ -7,6 +7,7 @@ import {
 } from '../models/service.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorizeRoles } from '../middleware/authorize.js';
+import { enforceBlockStatus } from '../middleware/block-status.js';
 import { receiveImageUpload } from '../middleware/image-upload.js';
 import { env } from '../config/env.js';
 import {
@@ -42,7 +43,7 @@ function parseBody<T>(schema: { safeParse: (value: unknown) => { success: true; 
 export function createVendorServicesRouter(database: Db, client: MongoClient) {
   const router = Router();
 
-  router.use(authenticate, authorizeRoles('vendor'));
+  router.use(authenticate, authorizeRoles('vendor'), enforceBlockStatus(database));
 
   router.post(
     '/services/upload-image',
