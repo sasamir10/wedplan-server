@@ -7,6 +7,8 @@ import {
 } from '../models/service.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorizeRoles } from '../middleware/authorize.js';
+import { receiveImageUpload } from '../middleware/image-upload.js';
+import { env } from '../config/env.js';
 import {
   createService,
   deleteVendorService,
@@ -14,6 +16,7 @@ import {
   updateVendorService,
   updateVendorServiceAvailability,
 } from '../services/service.service.js';
+import { uploadImageToImgBB } from '../services/image-upload.service.js';
 import { AppError } from '../utils/app-error.js';
 
 function requireVendorId(request: Request): string {
@@ -40,6 +43,27 @@ export function createVendorServicesRouter(database: Db, client: MongoClient) {
   const router = Router();
 
   router.use(authenticate, authorizeRoles('vendor'));
+
+  router.post(
+    '/services/upload-image',
+    (_request, _response, next) => {
+      if (!env.IMGBB_API_KEY) {
+        return next(new AppError('Image uploads are not configured.', 503));
+      }
+
+      return next();
+    },
+    receiveImageUpload,
+    async (request, response) => {
+      const image = request.uploadedImage;
+      if (!image) {
+        throw new AppError('An image file is required.', 400);
+      }
+
+      const uploadedImage = await uploadImageToImgBB(image, env.IMGBB_API_KEY);
+      response.status(201).json({ success: true, image: uploadedImage });
+    },
+  );
 
   router.post('/services', async (request, response) => {
     const input = parseBody(createServiceSchema, request.body);

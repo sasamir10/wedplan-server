@@ -10,7 +10,7 @@ const dnsServerSchema = z
     .transform((value) => value.split(",").map((server) => server.trim()))
     .pipe(z.array(z.union([z.ipv4(), z.ipv6()])).min(1));
 
-const optionalGoogleCredentialSchema = z.preprocess(
+const optionalCredentialSchema = z.preprocess(
     (value) => {
         if (typeof value !== "string") {
             return value;
@@ -32,8 +32,9 @@ const environmentSchema = z.object({
     BETTER_AUTH_SECRET: z.string().min(32),
     BETTER_AUTH_URL: z.string().url(),
 
-    GOOGLE_CLIENT_ID: optionalGoogleCredentialSchema,
-    GOOGLE_CLIENT_SECRET: optionalGoogleCredentialSchema,
+    GOOGLE_CLIENT_ID: optionalCredentialSchema,
+    GOOGLE_CLIENT_SECRET: optionalCredentialSchema,
+    IMGBB_API_KEY: optionalCredentialSchema,
 
     MONGODB_URI: z
         .url()
