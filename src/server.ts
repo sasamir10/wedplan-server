@@ -53,6 +53,14 @@ process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
 async function startServer(): Promise<void> {
   try {
+    if (!env.IMGBB_API_KEY) {
+      console.warn(
+        'ImgBB image uploads are disabled because IMGBB_API_KEY is not configured.',
+      );
+    } else {
+      console.info('ImgBB image uploads are configured.');
+    }
+
     if (env.NODE_ENV === 'development' && env.WEDPLAN_DNS_SERVERS) {
       setServers(env.WEDPLAN_DNS_SERVERS);
       console.info('Using the configured development DNS servers.');

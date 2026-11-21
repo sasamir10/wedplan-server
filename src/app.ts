@@ -11,6 +11,7 @@ import { healthRouter } from './routes/health.routes.js';
 import { protectedRouter } from './routes/protected.routes.js';
 import { createAdminServicesRouter } from './routes/admin-services.routes.js';
 import { createVendorServicesRouter } from './routes/vendor-services.routes.js';
+import { createPublicServicesRouter } from './routes/public-services.routes.js';
 
 export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) {
   const app = express();
@@ -33,6 +34,7 @@ export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) 
 
   app.use('/api', healthRouter);
   app.use('/api', protectedRouter);
+  app.use('/api/services', createPublicServicesRouter(database));
   app.use('/api/admin', createAdminServicesRouter(database));
   app.use('/api/vendor', createVendorServicesRouter(database, client));
 

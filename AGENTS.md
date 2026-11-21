@@ -2,11 +2,11 @@
 
 ## Architecture
 
-- `src/config` loads and validates process configuration.
+- `src/config` loads and validates process configuration and owns shared external connections.
 - `src/middleware` contains shared Express middleware for errors and unknown routes.
 - `src/routes` organizes REST endpoints by API area.
 - `src/utils` contains reusable application primitives such as `AppError`.
-- `src/app.ts` configures Express; `src/server.ts` starts the HTTP listener.
+- `src/app.ts` configures Express; `src/server.ts` connects to MongoDB before starting the HTTP listener and closes the connection during shutdown.
 
 ## TypeScript and ESM
 
@@ -31,6 +31,7 @@
 ## Security Principles
 
 - Validate environment variables at startup and never commit secrets.
+- Use the official MongoDB Node.js Driver through `src/config/database.ts`; do not log connection strings.
 - Keep Helmet enabled, restrict CORS to configured client origins, and use bounded body parsers.
 - Do not expose stack traces or internal error details to production clients.
 - Validate and normalize untrusted request data before using it.
