@@ -6,6 +6,7 @@ import {
 } from '../models/booking.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorizeRoles } from '../middleware/authorize.js';
+import { enforceBlockStatus } from '../middleware/block-status.js';
 import {
   cancelBooking,
   createBooking,
@@ -47,7 +48,7 @@ const emptyBookingBodySchema = {
 export function createCustomerBookingsRouter(database: Db) {
   const router = Router();
 
-  router.use(authenticate, authorizeRoles('customer'));
+  router.use(authenticate, authorizeRoles('customer'), enforceBlockStatus(database));
 
   router.get('/bookings', async (request, response) => {
     const query = parseQuery(request.query);

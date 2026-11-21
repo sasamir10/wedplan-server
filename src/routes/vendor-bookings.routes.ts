@@ -3,6 +3,7 @@ import type { Db } from 'mongodb';
 import { vendorBookingQuerySchema } from '../models/booking.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorizeRoles } from '../middleware/authorize.js';
+import { enforceBlockStatus } from '../middleware/block-status.js';
 import {
   acceptBooking,
   getVendorBookings,
@@ -44,7 +45,7 @@ const emptyBookingBodySchema = {
 export function createVendorBookingsRouter(database: Db) {
   const router = Router();
 
-  router.use(authenticate, authorizeRoles('vendor'));
+  router.use(authenticate, authorizeRoles('vendor'), enforceBlockStatus(database));
 
   router.get('/bookings', async (request, response) => {
     const query = parseQuery(request.query);

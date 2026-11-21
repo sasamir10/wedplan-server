@@ -115,6 +115,8 @@ function createDatabase(
               toArray: async () => users.filter((user) => matches(user, filter)),
             };
           },
+          findOne: async (filter: Record<string, unknown>) =>
+            users.find((user) => matches(user, filter)) ?? null,
         };
       }
 
@@ -200,7 +202,11 @@ test('authenticated customer, vendor, and admin can read an approved active serv
         email: 'private@example.com',
         password: 'private-hash',
         subscriptionPlan: 'premium',
+        isBlocked: false,
       },
+      { _id: new ObjectId(customerId), name: 'Customer', isBlocked: false },
+      { _id: new ObjectId(otherVendorId), name: 'Other Vendor', isBlocked: false },
+      { _id: new ObjectId(adminId), name: 'Admin', isBlocked: false },
     ],
   );
 
@@ -297,7 +303,10 @@ test('the details endpoint is protected by the real authentication middleware', 
 });
 
 test('an invalid service ID returns 404 without querying MongoDB', async () => {
-  const database = createDatabase([service()]);
+  const database = createDatabase(
+    [service()],
+    [{ _id: new ObjectId(customerId), name: 'Customer', isBlocked: false }],
+  );
 
   await withServicesServer(
     database.database,
@@ -321,7 +330,10 @@ test('an invalid service ID returns 404 without querying MongoDB', async () => {
 });
 
 test('a nonexistent service returns 404 and queries only approved active services', async () => {
-  const database = createDatabase([service()]);
+  const database = createDatabase(
+    [service()],
+    [{ _id: new ObjectId(customerId), name: 'Customer', isBlocked: false }],
+  );
   const missingId = new ObjectId().toHexString();
 
   await withServicesServer(
@@ -349,7 +361,10 @@ test('pending, rejected, and inactive services all return 404', async () => {
     { availability: false },
   ]) {
     const hidden = service(overrides);
-    const database = createDatabase([hidden]);
+    const database = createDatabase(
+      [hidden],
+      [{ _id: new ObjectId(customerId), name: 'Customer', isBlocked: false }],
+    );
 
     await withServicesServer(
       database.database,
@@ -375,7 +390,10 @@ test('pending, rejected, and inactive services all return 404', async () => {
 
 test('a missing vendor is handled safely and private fields are never selected', async () => {
   const approved = service();
-  const database = createDatabase([approved]);
+  const database = createDatabase(
+    [approved],
+    [{ _id: new ObjectId(customerId), name: 'Customer', isBlocked: false }],
+  );
 
   await withServicesServer(
     database.database,
@@ -403,7 +421,10 @@ test('a missing vendor is handled safely and private fields are never selected',
 
 test('a malformed vendor ID is handled without querying arbitrary user strings', async () => {
   const approved = service({ vendorId: 'not-an-object-id' });
-  const database = createDatabase([approved]);
+  const database = createDatabase(
+    [approved],
+    [{ _id: new ObjectId(customerId), name: 'Customer', isBlocked: false }],
+  );
 
   await withServicesServer(
     database.database,

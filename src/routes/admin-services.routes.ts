@@ -7,6 +7,7 @@ import {
 } from '../models/admin-service.js';
 import { authenticate } from '../middleware/authenticate.js';
 import { authorizeRoles } from '../middleware/authorize.js';
+import { enforceBlockStatus } from '../middleware/block-status.js';
 import {
   approvePendingService,
   deleteAdminService,
@@ -38,7 +39,7 @@ function parseQuery(requestQuery: unknown) {
 export function createAdminServicesRouter(database: Db) {
   const router = Router();
 
-  router.use(authenticate, authorizeRoles('admin'));
+  router.use(authenticate, authorizeRoles('admin'), enforceBlockStatus(database));
 
   router.get('/services', async (request, response) => {
     const query = parseQuery(request.query);

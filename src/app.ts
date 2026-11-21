@@ -8,7 +8,8 @@ import { env } from './config/env.js';
 import { errorHandler } from './middleware/error-handler.js';
 import { notFound } from './middleware/not-found.js';
 import { healthRouter } from './routes/health.routes.js';
-import { protectedRouter } from './routes/protected.routes.js';
+import { createProtectedRouter } from './routes/protected.routes.js';
+import { createAdminRouter } from './routes/admin-router.js';
 import { createAdminServicesRouter } from './routes/admin-services.routes.js';
 import { createVendorServicesRouter } from './routes/vendor-services.routes.js';
 import { createPublicServicesRouter } from './routes/public-services.routes.js';
@@ -38,8 +39,9 @@ export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) 
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
   app.use('/api', healthRouter);
-  app.use('/api', protectedRouter);
+  app.use('/api', createProtectedRouter(database));
   app.use('/api/services', createPublicServicesRouter(database));
+  app.use('/api/admin', createAdminRouter(database));
   app.use('/api/admin', createAdminServicesRouter(database));
   app.use('/api/vendor', createVendorServicesRouter(database, client));
   app.use('/api/vendor', createVendorBookingsRouter(database));

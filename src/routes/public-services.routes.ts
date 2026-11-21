@@ -1,6 +1,7 @@
 import { Router, type RequestHandler } from 'express';
 import type { Db } from 'mongodb';
 import { authenticate } from '../middleware/authenticate.js';
+import { enforceBlockStatus } from '../middleware/block-status.js';
 import { publicServiceQuerySchema } from '../models/public-service.js';
 import { AppError } from '../utils/app-error.js';
 import {
@@ -45,7 +46,7 @@ export function createPublicServicesRouter(
   });
 
   // Registered after the named routes so "/featured" is never read as an ID.
-  router.get('/:id', authenticateRequest, async (request, response) => {
+  router.get('/:id', authenticateRequest, enforceBlockStatus(database), async (request, response) => {
     const viewerId = request.authenticatedUser?.id;
     const serviceId = request.params.id;
 
