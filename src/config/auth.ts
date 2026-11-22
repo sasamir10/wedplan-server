@@ -19,8 +19,10 @@ export function createAuth(database: Db, client: MongoClient) {
         baseURL: env.BETTER_AUTH_URL,
         trustedOrigins: [env.CLIENT_URL],
         advanced: {
+            useSecureCookies: true,
             defaultCookieAttributes: {
                 sameSite: "none" as const,
+                partitioned: true,
             },
         },
         emailAndPassword: {
