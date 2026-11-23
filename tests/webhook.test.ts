@@ -36,6 +36,8 @@ interface MockCheckoutSession {
   subscription: string | null;
   customer: string | null;
   payment_status: string;
+  amount_total: number;
+  currency: string;
   metadata: Record<string, string>;
 }
 
@@ -90,12 +92,26 @@ interface MockUserDocument {
   isBlocked?: unknown;
 }
 
+interface MockTransactionDocument {
+  vendorId: ObjectId | string;
+  stripeCheckoutSessionId: string;
+  stripeCustomerId: string;
+  stripeSubscriptionId: string;
+  amount: number;
+  currency: string;
+  status: string;
+  createdAt: Date;
+}
+
 interface MockDatabase {
   collectionCalls: Array<{ name: string }>;
   users: Map<string, MockUserDocument>;
   updateOneCalls: Array<{
     filter: Record<string, unknown>;
     update: Record<string, unknown>;
+  }>;
+  transactionCalls: Array<{
+    document: Partial<MockTransactionDocument>;
   }>;
 }
 
@@ -109,6 +125,7 @@ function createMockDatabase(users: MockUserDocument[]): MockDatabase {
     collectionCalls: [],
     users: usersMap,
     updateOneCalls: [],
+    transactionCalls: [],
   } as unknown as MockDatabase;
 }
 
@@ -138,6 +155,15 @@ function createDbMock(db: MockDatabase): Db {
               }
             }
             return { matchedCount: 1, modifiedCount: 1 };
+          },
+        } as never;
+      }
+
+      if (name === 'transactions') {
+        return {
+          insertOne: async (document: unknown) => {
+            db.transactionCalls.push({ document: document as Partial<MockTransactionDocument> });
+            return { acknowledged: true, insertedId: new ObjectId() };
           },
         } as never;
       }
@@ -371,6 +397,8 @@ function validSession(): MockCheckoutSession {
     subscription: 'sub_test_123',
     customer: 'cus_test_123',
     payment_status: 'paid',
+    amount_total: 4999,
+    currency: 'usd',
     metadata: {
       vendorId: VENDOR_ID,
     },
@@ -789,6 +817,215 @@ test('trialing subscription status activates Premium', async () => {
       const user = db.users.get(VENDOR_ID)!;
       assert.equal(user.subscriptionPlan, 'premium');
       assert.equal(db.updateOneCalls.length, 1);
+    },
+  );
+});
+
+test('valid verified checkout creates a transaction record', async () => {
+  const db = createMockDatabase([vendorUser()]);
+  const stripeClient = createMockStripeClient({
+    constructEvent: mockConstructEvent('checkout.session.completed', validSession()),
+    session: validSession(),
+    subscription: validSubscription(),
+  });
+
+  await withWebhookServer(
+    { stripeClient, webhookSecret: 'whsec_test', database: createDbMock(db) },
+    async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/webhooks/stripe`, {
+        method: 'POST',
+        headers: {
+          'stripe-signature': 't=1234567890,v1=testsig',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: 'checkout.session.completed',
+          data: { object: validSession() },
+        }),
+      });
+
+      assert.equal(response.status, 200);
+
+      assert.equal(db.transactionCalls.length, 1);
+      const tx = db.transactionCalls[0].document;
+      assert.equal((tx.vendorId as ObjectId).toHexString(), VENDOR_ID);
+      assert.equal(tx.stripeCheckoutSessionId, 'cs_test_123');
+      assert.equal(tx.stripeCustomerId, 'cus_test_123');
+      assert.equal(tx.stripeSubscriptionId, 'sub_test_123');
+      assert.equal(tx.amount, 4999);
+      assert.equal(tx.currency, 'usd');
+      assert.equal(tx.status, 'paid');
+      assert.ok(tx.createdAt instanceof Date);
+    },
+  );
+});
+
+test('invalid payment status does not create a transaction', async () => {
+  const db = createMockDatabase([vendorUser()]);
+  const stripeClient = createMockStripeClient({
+    constructEvent: mockConstructEvent('checkout.session.completed', {
+      ...validSession(),
+      payment_status: 'unpaid',
+    }),
+    session: { ...validSession(), payment_status: 'unpaid' },
+    subscription: validSubscription(),
+  });
+
+  await withWebhookServer(
+    { stripeClient, webhookSecret: 'whsec_test', database: createDbMock(db) },
+    async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/webhooks/stripe`, {
+        method: 'POST',
+        headers: {
+          'stripe-signature': 't=1234567890,v1=testsig',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: 'checkout.session.completed',
+          data: { object: { ...validSession(), payment_status: 'unpaid' } },
+        }),
+      });
+
+      assert.equal(response.status, 200);
+      assert.equal(db.transactionCalls.length, 0);
+    },
+  );
+});
+
+test('nonexistent vendor does not create a transaction', async () => {
+  const db = createMockDatabase([]);
+  const stripeClient = createMockStripeClient({
+    constructEvent: mockConstructEvent('checkout.session.completed', validSession()),
+    session: validSession(),
+    subscription: validSubscription(),
+  });
+
+  await withWebhookServer(
+    { stripeClient, webhookSecret: 'whsec_test', database: createDbMock(db) },
+    async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/webhooks/stripe`, {
+        method: 'POST',
+        headers: {
+          'stripe-signature': 't=1234567890,v1=testsig',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: 'checkout.session.completed',
+          data: { object: validSession() },
+        }),
+      });
+
+      assert.equal(response.status, 200);
+      assert.equal(db.transactionCalls.length, 0);
+    },
+  );
+});
+
+test('customer account does not create a transaction', async () => {
+  const db = createMockDatabase([customerUser()]);
+  const stripeClient = createMockStripeClient({
+    constructEvent: mockConstructEvent('checkout.session.completed', validSession()),
+    session: validSession(),
+    subscription: validSubscription(),
+  });
+
+  await withWebhookServer(
+    { stripeClient, webhookSecret: 'whsec_test', database: createDbMock(db) },
+    async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/webhooks/stripe`, {
+        method: 'POST',
+        headers: {
+          'stripe-signature': 't=1234567890,v1=testsig',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: 'checkout.session.completed',
+          data: { object: validSession() },
+        }),
+      });
+
+      assert.equal(response.status, 200);
+      assert.equal(db.transactionCalls.length, 0);
+    },
+  );
+});
+
+test('database insertion failure is handled safely', async () => {
+  const db = createMockDatabase([vendorUser()]);
+
+  const failingDb = {
+    ...createDbMock(db),
+    collection: (name: string) => {
+      if (name === 'user') {
+        return {
+          findOne: async () => vendorUser(),
+          updateOne: async () => ({ matchedCount: 1, modifiedCount: 1 }),
+        } as never;
+      }
+
+      if (name === 'transactions') {
+        throw new Error('Database insertion failed');
+      }
+
+      return {} as never;
+    },
+  } as unknown as Db;
+
+  const stripeClient = createMockStripeClient({
+    constructEvent: mockConstructEvent('checkout.session.completed', validSession()),
+    session: validSession(),
+    subscription: validSubscription(),
+  });
+
+  await withWebhookServer(
+    { stripeClient, webhookSecret: 'whsec_test', database: failingDb },
+    async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/webhooks/stripe`, {
+        method: 'POST',
+        headers: {
+          'stripe-signature': 't=1234567890,v1=testsig',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: 'checkout.session.completed',
+          data: { object: validSession() },
+        }),
+      });
+
+      assert.equal(response.status, 200);
+    },
+  );
+});
+
+test('existing Premium activation still works after transaction insert', async () => {
+  const db = createMockDatabase([vendorUser()]);
+  const stripeClient = createMockStripeClient({
+    constructEvent: mockConstructEvent('checkout.session.completed', validSession()),
+    session: validSession(),
+    subscription: validSubscription(),
+  });
+
+  await withWebhookServer(
+    { stripeClient, webhookSecret: 'whsec_test', database: createDbMock(db) },
+    async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/webhooks/stripe`, {
+        method: 'POST',
+        headers: {
+          'stripe-signature': 't=1234567890,v1=testsig',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: 'checkout.session.completed',
+          data: { object: validSession() },
+        }),
+      });
+
+      assert.equal(response.status, 200);
+
+      const user = db.users.get(VENDOR_ID)!;
+      assert.equal(user.subscriptionPlan, 'premium');
+      assert.equal(db.updateOneCalls.length, 1);
+      assert.equal(db.transactionCalls.length, 1);
     },
   );
 });

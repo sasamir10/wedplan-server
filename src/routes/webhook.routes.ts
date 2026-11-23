@@ -1,9 +1,10 @@
 import express from 'express';
-import type { Db } from 'mongodb';
+import { ObjectId, type Db } from 'mongodb';
 import type { StripeClient } from '../services/stripe.service.js';
 import { AppError } from '../utils/app-error.js';
 import { getStripe } from '../services/stripe.service.js';
 import { toBetterAuthUserObjectId } from '../utils/object-id.js';
+import type { TransactionDocument } from '../models/transaction.js';
 
 interface StripeWebhookRouterOptions {
   /**
@@ -80,6 +81,8 @@ interface StripeCheckoutSession {
   subscription: string | null;
   customer: string | null;
   payment_status: string;
+  amount_total: number;
+  currency: string;
   metadata: Record<string, string>;
 }
 
@@ -171,4 +174,24 @@ async function handleCheckoutSessionCompleted(
     { _id: vendorObjectId },
     { $set: { subscriptionPlan: 'premium' } },
   );
+
+  const transaction: TransactionDocument = {
+    _id: new ObjectId(),
+    vendorId: vendorObjectId,
+    stripeCheckoutSessionId: sessionObject.id,
+    stripeCustomerId: sessionObject.customer,
+    stripeSubscriptionId: sessionObject.subscription,
+    amount: sessionObject.amount_total,
+    currency: sessionObject.currency,
+    status: sessionObject.payment_status,
+    createdAt: new Date(),
+  };
+
+  try {
+    await database.collection('transactions').insertOne(transaction);
+  } catch {
+    // Transaction record persistence is best-effort. Premium activation
+    // has already succeeded; a database failure here must not break the
+    // webhook acknowledgment to Stripe.
+  }
 }
