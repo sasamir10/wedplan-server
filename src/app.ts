@@ -18,6 +18,7 @@ import { createVendorBookingsRouter } from './routes/vendor-bookings.routes.js';
 import { createVendorDashboardRouter } from './routes/vendor-dashboard.routes.js';
 import { createCustomerDashboardRouter } from './routes/customer-dashboard.routes.js';
 import { createProfileRouter } from './routes/profile.routes.js';
+import { createSubscriptionRouter } from './routes/subscription.routes.js';
 
 export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) {
   const app = express();
@@ -48,6 +49,7 @@ export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) 
   app.use('/api/vendor', createVendorDashboardRouter(database));
   app.use('/api/customer', createCustomerBookingsRouter(database));
   app.use('/api/customer', createCustomerDashboardRouter(database));
+  app.use('/api/vendor', createSubscriptionRouter(database));
   app.use('/api/profile', createProfileRouter(database));
 
   app.use(notFound);

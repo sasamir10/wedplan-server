@@ -107,4 +107,6 @@ export const env = {
               .map((server) => server.trim())
               .filter(Boolean)
         : undefined,
+    STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
+    STRIPE_PRICE_ID_PREMIUM: process.env.STRIPE_PRICE_ID_PREMIUM || "",
 };
