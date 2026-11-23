@@ -19,6 +19,7 @@ import { createVendorDashboardRouter } from './routes/vendor-dashboard.routes.js
 import { createCustomerDashboardRouter } from './routes/customer-dashboard.routes.js';
 import { createProfileRouter } from './routes/profile.routes.js';
 import { createSubscriptionRouter } from './routes/subscription.routes.js';
+import { createStripeWebhookRouter } from './routes/webhook.routes.js';
 
 export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) {
   const app = express();
@@ -35,6 +36,10 @@ export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) 
   );
 
   app.all('/api/auth/{*path}', toNodeHandler(auth));
+
+  // Webhook routes must be mounted before express.json() so the raw body
+  // buffer is available for Stripe signature verification.
+  app.use('/api/webhooks', createStripeWebhookRouter(database));
 
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));
