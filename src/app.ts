@@ -39,7 +39,10 @@ export function createApp(auth: WedPlanAuth, database: Db, client: MongoClient) 
 
   // Webhook routes must be mounted before express.json() so the raw body
   // buffer is available for Stripe signature verification.
-  app.use('/api/webhooks', createStripeWebhookRouter(database));
+  app.use(
+    '/api/webhooks',
+    createStripeWebhookRouter(database, { client }),
+  );
 
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));

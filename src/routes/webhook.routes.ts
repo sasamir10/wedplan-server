@@ -1,10 +1,11 @@
 import express from 'express';
-import { ObjectId, type Db } from 'mongodb';
+import { ObjectId, type Db, type MongoClient } from 'mongodb';
 import type { StripeClient } from '../services/stripe.service.js';
 import { AppError } from '../utils/app-error.js';
 import { getStripe } from '../services/stripe.service.js';
 import { toBetterAuthUserObjectId } from '../utils/object-id.js';
 import type { TransactionDocument } from '../models/transaction.js';
+import type { WebhookEventDocument } from '../models/webhook-event.js';
 
 interface StripeWebhookRouterOptions {
   /**
@@ -12,6 +13,11 @@ interface StripeWebhookRouterOptions {
    * so the live Stripe client from getStripe() is used.
    */
   stripeClient?: StripeClient;
+  /**
+   * Injected MongoDB client for transaction support. Production callers omit it,
+   * so the live client is obtained from the application context.
+   */
+  client?: MongoClient;
 }
 
 export function createStripeWebhookRouter(
@@ -20,6 +26,7 @@ export function createStripeWebhookRouter(
 ) {
   const router = express.Router();
   const stripeClient = options.stripeClient ?? getStripe();
+  const mongoClient = options.client;
 
   // Must be mounted before express.json() so the raw body buffer is available
   // for Stripe signature verification. express.json() would consume and parse
@@ -65,7 +72,12 @@ export function createStripeWebhookRouter(
       }
 
       if (event.type === 'checkout.session.completed') {
-        await handleCheckoutSessionCompleted(stripeClient, database, event);
+        await handleCheckoutSessionCompleted(
+          stripeClient,
+          database,
+          mongoClient,
+          event,
+        );
       }
 
       response.status(200).json({ success: true, received: true });
@@ -100,9 +112,23 @@ interface StripeSubscription {
 async function handleCheckoutSessionCompleted(
   stripeClient: StripeClient,
   database: Db,
-  event: { data: { object: unknown } },
+  mongoClient: MongoClient | undefined,
+  event: { id: string; type: string; data: { object: unknown } },
 ): Promise<void> {
   const sessionObject = event.data.object as StripeCheckoutSession;
+  const eventId = event.id as string;
+
+  // Idempotency: if this event was already successfully processed, skip.
+  const alreadyProcessed = await database
+    .collection('webhook-events')
+    .findOne({ stripeEventId: eventId, status: 'completed' });
+
+  if (alreadyProcessed) {
+    return;
+  }
+
+  // Early-exit validation checks — these are not errors, just events we
+  // do not act upon. No database writes occur, so no transaction is needed.
 
   if (sessionObject.mode !== 'subscription') {
     return;
@@ -160,7 +186,9 @@ async function handleCheckoutSessionCompleted(
     return;
   }
 
-  const vendor = await database.collection('user').findOne({ _id: vendorObjectId });
+  const vendor = await database.collection('user').findOne({
+    _id: vendorObjectId,
+  });
 
   if (!vendor) {
     return;
@@ -170,28 +198,159 @@ async function handleCheckoutSessionCompleted(
     return;
   }
 
-  await database.collection('user').updateOne(
-    { _id: vendorObjectId },
-    { $set: { subscriptionPlan: 'premium' } },
-  );
+  // All verification checks passed. Use a MongoDB session transaction to
+  // atomically record the webhook event, activate Premium, and insert the
+  // payment transaction. If any operation fails, the transaction rolls back
+  // and Stripe can safely retry.
+  if (!mongoClient) {
+    throw new AppError(
+      'MongoDB client not available for transactional processing.',
+      500,
+      true,
+      'MONGO_CLIENT_UNAVAILABLE',
+    );
+  }
 
-  const transaction: TransactionDocument = {
-    _id: new ObjectId(),
-    vendorId: vendorObjectId,
-    stripeCheckoutSessionId: sessionObject.id,
-    stripeCustomerId: sessionObject.customer,
-    stripeSubscriptionId: sessionObject.subscription,
-    amount: sessionObject.amount_total,
-    currency: sessionObject.currency,
-    status: sessionObject.payment_status,
-    createdAt: new Date(),
-  };
+  const session = mongoClient.startSession();
 
   try {
-    await database.collection('transactions').insertOne(transaction);
-  } catch {
-    // Transaction record persistence is best-effort. Premium activation
-    // has already succeeded; a database failure here must not break the
-    // webhook acknowledgment to Stripe.
+    await session.withTransaction(async () => {
+      // Re-check inside the transaction to handle concurrent duplicate
+      // deliveries. Another request may have completed processing while
+      // this request was waiting for the session/locks.
+      const concurrentProcessed = await database
+        .collection('webhook-events')
+        .findOne(
+          { stripeEventId: eventId, status: 'completed' },
+          { session },
+        );
+
+      if (concurrentProcessed) {
+        return;
+      }
+
+      // Record the webhook event as pending. The unique index on
+      // stripeEventId prevents duplicate processing across concurrent
+      // requests — a duplicate-key error here means another request is
+      // already handling this exact event.
+      const webhookEvent: WebhookEventDocument = {
+        _id: new ObjectId(),
+        stripeEventId: eventId,
+        eventType: event.type,
+        status: 'pending',
+        checkoutSessionId: sessionObject.id,
+        vendorId: vendorObjectId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      await database.collection('webhook-events').insertOne(webhookEvent, {
+        session,
+      });
+
+      // Check if a transaction already exists for this Checkout Session.
+      // If another request already processed a different event for the same
+      // session, we mark our event as completed without creating a duplicate
+      // transaction.
+      const existingTransaction = await database
+        .collection('transactions')
+        .findOne(
+          { stripeCheckoutSessionId: sessionObject.id },
+          { session },
+        );
+
+      if (existingTransaction) {
+        // Transaction already exists — mark our event as completed and skip
+        // the Premium update and transaction insert (already done by the
+        // other request).
+        await database
+          .collection('webhook-events')
+          .updateOne(
+            { stripeEventId: eventId },
+            {
+              $set: {
+                status: 'completed',
+                processedAt: new Date(),
+                updatedAt: new Date(),
+              },
+            },
+            { session },
+          );
+        return;
+      }
+
+      // Activate Premium subscription for the vendor.
+      await database.collection('user').updateOne(
+        { _id: vendorObjectId },
+        { $set: { subscriptionPlan: 'premium' } },
+        { session },
+      );
+
+      // Insert the payment transaction record. The unique index on
+      // stripeCheckoutSessionId prevents duplicate transactions for the
+      // same Checkout Session even across different event IDs.
+      const transaction: TransactionDocument = {
+        _id: new ObjectId(),
+        vendorId: vendorObjectId,
+        stripeCheckoutSessionId: sessionObject.id,
+        stripeCustomerId: sessionObject.customer!,
+        stripeSubscriptionId: sessionObject.subscription!,
+        amount: sessionObject.amount_total,
+        currency: sessionObject.currency,
+        status: sessionObject.payment_status,
+        createdAt: new Date(),
+      };
+
+      await database.collection('transactions').insertOne(transaction, {
+        session,
+      });
+
+      // Mark the webhook event as successfully processed.
+      await database
+        .collection('webhook-events')
+        .updateOne(
+          { stripeEventId: eventId },
+          {
+            $set: {
+              status: 'completed',
+              processedAt: new Date(),
+              updatedAt: new Date(),
+            },
+          },
+          { session },
+        );
+    });
+  } catch (error) {
+    // withTransaction aborts automatically on error, rolling back all writes.
+    // A duplicate-key error (code 11000) means a concurrent request won the
+    // race on either the webhook-events or transactions unique index.
+    const mongoError = error as { code?: number; name?: string };
+    if (mongoError.code === 11000) {
+      // Re-check whether this specific event was completed by the concurrent
+      // request. Only return 200 if MongoDB confirms successful processing.
+      const completed = await database
+        .collection('webhook-events')
+        .findOne({ stripeEventId: eventId, status: 'completed' });
+      if (completed) {
+        return;
+      }
+      // Event not confirmed as processed — return 500 so Stripe retries.
+      // The retry will either find the completed event or process fresh.
+      throw new AppError(
+        'Webhook processing failed due to concurrent modification. Stripe will retry.',
+        500,
+        true,
+        'WEBHOOK_CONCURRENT_MODIFICATION',
+      );
+    }
+
+    throw new AppError(
+      'Webhook processing failed. Stripe will retry.',
+      500,
+      true,
+      'WEBHOOK_PROCESSING_FAILED',
+    );
+  } finally {
+    await session.endSession();
   }
 }

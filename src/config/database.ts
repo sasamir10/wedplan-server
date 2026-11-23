@@ -74,6 +74,86 @@ export function getMongoErrorDiagnostics(error: unknown): {
 }
 
 /**
+ * Creates the idempotent indexes required by the `webhook-events` collection.
+ *
+ * The unique index on `stripeEventId` prevents the same Stripe webhook event
+ * from being processed more than once. Index creation is idempotent: repeating
+ * it with the same name and specification is a no-op.
+ */
+export async function ensureWebhookIndexes(database: Db): Promise<void> {
+  const webhookEvents = database.collection('webhook-events');
+  await webhookEvents.createIndexes([
+    {
+      key: { stripeEventId: 1 },
+      name: 'idx_webhook_events_stripe_event_id_unique',
+      unique: true,
+    },
+    {
+      key: { status: 1, createdAt: -1 },
+      name: 'idx_webhook_events_status_created_at',
+    },
+  ]);
+
+  const transactions = database.collection('transactions');
+
+  // Migration: if a pre-existing full unique index with the same name exists
+  // (without partialFilterExpression), drop it first. MongoDB rejects
+  // createIndexes when the same index name has different options
+  // (IndexOptionsConflict). Dropping then recreating is safe: no documents
+  // are deleted, and duplicate non-empty string Checkout Session IDs are
+  // checked before the new index is created.
+  const existingIndexes = await (await transactions.listIndexes()).toArray();
+  const outdatedIndex = existingIndexes.find(
+    (index) =>
+      index.name === 'idx_transactions_stripe_checkout_session_id_unique' &&
+      !index.partialFilterExpression,
+  );
+
+  if (outdatedIndex) {
+    await transactions.dropIndex('idx_transactions_stripe_checkout_session_id_unique');
+  }
+
+  // Verify no duplicate non-empty string Checkout Session IDs exist before
+  // creating the partial unique index. If duplicates exist, fail safely
+  // with a clear server-side error — do not delete or modify documents.
+  const duplicateSessions = await (await transactions
+    .aggregate([
+      {
+        $match: {
+          stripeCheckoutSessionId: { $type: 'string', $ne: '' },
+        },
+      },
+      {
+        $group: {
+          _id: '$stripeCheckoutSessionId',
+          count: { $sum: 1 },
+        },
+      },
+      {
+        $match: { count: { $gt: 1 } },
+      },
+    ])
+    ).toArray();
+
+  if (duplicateSessions.length > 0) {
+    throw new Error(
+      `Cannot create unique index on transactions.stripeCheckoutSessionId: ` +
+      `${duplicateSessions.length} duplicate Checkout Session ID(s) found. ` +
+      `Resolve duplicates before deploying this migration.`,
+    );
+  }
+
+  await transactions.createIndexes([
+    {
+      key: { stripeCheckoutSessionId: 1 },
+      name: 'idx_transactions_stripe_checkout_session_id_unique',
+      unique: true,
+      partialFilterExpression: { stripeCheckoutSessionId: { $type: 'string' } },
+    },
+  ]);
+}
+
+/**
  * Creates the idempotent indexes required by the `bookings` collection.
  *
  * Index creation is idempotent: repeating it with the same name and
@@ -135,6 +215,7 @@ export function connectToDatabase(): Promise<Db> {
       await connectedDatabase.command({ ping: 1 });
 
       await ensureBookingIndexes(connectedDatabase);
+      await ensureWebhookIndexes(connectedDatabase);
 
       database = connectedDatabase;
       console.info('MongoDB connection established.');
