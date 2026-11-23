@@ -309,3 +309,65 @@ test('getVendorStats rejects unknown subscription plan values', async () => {
 
   assert.equal(stats.subscriptionPlan, 'free');
 });
+
+test('getVendorStats exposes premium subscription lifecycle fields', async () => {
+  const database = createMemoryDatabase({
+    services: [],
+    bookings: [],
+    users: [
+      userRecord(VENDOR_ONE_ID, {
+        subscriptionPlan: 'premium',
+        stripeSubscriptionId: 'sub_live_123',
+        subscriptionStatus: 'active',
+        subscriptionCancelAtPeriodEnd: true,
+        subscriptionCurrentPeriodEnd: '2030-01-01T00:00:00.000Z',
+      }),
+    ],
+  });
+
+  const stats = await getVendorStats(database, VENDOR_ONE_ID);
+
+  assert.equal(stats.subscriptionPlan, 'premium');
+  assert.equal(stats.subscriptionStatus, 'active');
+  assert.equal(stats.subscriptionCancelAtPeriodEnd, true);
+  assert.equal(
+    stats.subscriptionCurrentPeriodEnd,
+    '2030-01-01T00:00:00.000Z',
+  );
+  assert.equal(stats.hasActiveSubscription, true);
+});
+
+test('getVendorStats normalizes missing lifecycle fields for free vendors', async () => {
+  const database = createMemoryDatabase({
+    services: [],
+    bookings: [],
+    users: [userRecord(VENDOR_ONE_ID)],
+  });
+
+  const stats = await getVendorStats(database, VENDOR_ONE_ID);
+
+  assert.equal(stats.subscriptionPlan, 'free');
+  assert.equal(stats.subscriptionStatus, null);
+  assert.equal(stats.subscriptionCancelAtPeriodEnd, false);
+  assert.equal(stats.subscriptionCurrentPeriodEnd, null);
+  assert.equal(stats.hasActiveSubscription, false);
+});
+
+test('getVendorStats treats an invalid stored period end as unavailable', async () => {
+  const database = createMemoryDatabase({
+    services: [],
+    bookings: [],
+    users: [
+      userRecord(VENDOR_ONE_ID, {
+        subscriptionPlan: 'premium',
+        stripeSubscriptionId: 'sub_live_123',
+        subscriptionCurrentPeriodEnd: 'not-a-date',
+      }),
+    ],
+  });
+
+  const stats = await getVendorStats(database, VENDOR_ONE_ID);
+
+  assert.equal(stats.subscriptionCurrentPeriodEnd, null);
+  assert.equal(stats.hasActiveSubscription, true);
+});

@@ -47,9 +47,13 @@ interface MockCheckoutSession {
 interface MockSubscription {
   id: string;
   status: string;
+  cancel_at_period_end?: boolean;
+  current_period_end?: number;
+  customer?: string | { id: string };
   items: {
     data: Array<{
       price: { id: string };
+      current_period_end?: number;
     }>;
   };
   metadata: Record<string, string>;
@@ -93,6 +97,11 @@ interface MockUserDocument {
   role?: unknown;
   subscriptionPlan?: unknown;
   isBlocked?: unknown;
+  stripeSubscriptionId?: string | null;
+  stripeCustomerId?: string | null;
+  subscriptionStatus?: string | null;
+  subscriptionCancelAtPeriodEnd?: boolean;
+  subscriptionCurrentPeriodEnd?: string | null;
 }
 
 interface MockTransactionDocument {
@@ -608,16 +617,46 @@ function validSubscription(): MockSubscription {
   return {
     id: 'sub_test_123',
     status: 'active',
+    cancel_at_period_end: false,
+    customer: 'cus_test_123',
     items: {
       data: [
         {
           price: { id: 'price_premium_test' },
+          current_period_end: 1893456000,
         },
       ],
     },
     metadata: {
       vendorId: VENDOR_ID,
     },
+  };
+}
+
+function premiumVendor(
+  overrides: Partial<MockUserDocument> = {},
+): MockUserDocument {
+  return {
+    _id: VENDOR_ID,
+    name: 'Test Vendor',
+    role: 'vendor',
+    subscriptionPlan: 'premium',
+    isBlocked: false,
+    stripeSubscriptionId: 'sub_test_123',
+    stripeCustomerId: 'cus_test_123',
+    subscriptionStatus: 'active',
+    subscriptionCancelAtPeriodEnd: false,
+    subscriptionCurrentPeriodEnd: '2029-01-01T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function lifecycleSubscription(
+  overrides: Partial<MockSubscription> = {},
+): MockSubscription {
+  return {
+    ...validSubscription(),
+    ...overrides,
   };
 }
 
@@ -648,6 +687,14 @@ test('valid completed subscription checkout activates the correct vendor', async
 
       const user = db.users.get(VENDOR_ID)!;
       assert.equal(user.subscriptionPlan, 'premium');
+      assert.equal(user.stripeSubscriptionId, 'sub_test_123');
+      assert.equal(user.stripeCustomerId, 'cus_test_123');
+      assert.equal(user.subscriptionStatus, 'active');
+      assert.equal(user.subscriptionCancelAtPeriodEnd, false);
+      assert.equal(
+        user.subscriptionCurrentPeriodEnd,
+        '2030-01-01T00:00:00.000Z',
+      );
 
       assert.equal(db.updateOneCalls.length, 1);
       assert.equal((db.updateOneCalls[0].filter._id as ObjectId).toHexString(), VENDOR_ID);
@@ -1804,4 +1851,363 @@ test('duplicate non-empty Checkout Session IDs prevent index creation', async ()
 
   // No transaction documents were dropped or modified
   assert.equal(db.transactionCalls.length, 2);
+});
+
+// ----- Subscription lifecycle tests -----
+
+async function deliverLifecycleEvent(options: {
+  db: MockDatabase;
+  eventType: string;
+  object: unknown;
+  eventId: string;
+  database?: Db;
+}): Promise<number> {
+  const stripeClient = createMockStripeClient({
+    constructEvent: mockConstructEvent(
+      options.eventType,
+      options.object,
+      options.eventId,
+    ),
+  });
+
+  let status = 0;
+
+  await withWebhookServer(
+    {
+      stripeClient,
+      webhookSecret: 'whsec_test',
+      database: options.database ?? createDbMock(options.db),
+    },
+    async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/webhooks/stripe`, {
+        method: 'POST',
+        headers: {
+          'stripe-signature': 't=1234567890,v1=testsig',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: options.eventType,
+          data: { object: options.object },
+        }),
+      });
+
+      status = response.status;
+    },
+  );
+
+  return status;
+}
+
+test('customer.subscription.updated syncs lifecycle fields and keeps Premium', async () => {
+  const db = createMockDatabase([premiumVendor()]);
+  const subscription = lifecycleSubscription({
+    status: 'active',
+    cancel_at_period_end: true,
+  });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.updated',
+    object: subscription,
+    eventId: 'evt_sub_updated',
+  });
+
+  assert.equal(status, 200);
+
+  const user = db.users.get(VENDOR_ID)!;
+  assert.equal(user.subscriptionPlan, 'premium');
+  assert.equal(user.subscriptionStatus, 'active');
+  assert.equal(user.subscriptionCancelAtPeriodEnd, true);
+  assert.equal(
+    user.subscriptionCurrentPeriodEnd,
+    '2030-01-01T00:00:00.000Z',
+  );
+
+  assert.equal(db.updateOneCalls.length, 1);
+  const set = (db.updateOneCalls[0].update as { $set: Record<string, unknown> })
+    .$set;
+  assert.equal(set.subscriptionPlan, undefined);
+
+  const event = db.webhookEvents.get('evt_sub_updated');
+  assert.ok(event);
+  assert.equal(event.status, 'completed');
+  assert.equal(event.eventType, 'customer.subscription.updated');
+});
+
+test('customer.subscription.updated never activates Premium for a free vendor', async () => {
+  const db = createMockDatabase([vendorUser()]);
+  const subscription = lifecycleSubscription({ status: 'active' });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.updated',
+    object: subscription,
+    eventId: 'evt_sub_free_update',
+  });
+
+  assert.equal(status, 200);
+
+  const user = db.users.get(VENDOR_ID)!;
+  assert.equal(user.subscriptionPlan, 'free');
+  assert.equal(db.updateOneCalls.length, 0);
+  assert.equal(db.webhookEvents.size, 0);
+});
+
+test('customer.subscription.updated does not upgrade an inconsistent free vendor with a stored subscription', async () => {
+  const db = createMockDatabase([
+    premiumVendor({ subscriptionPlan: 'free' }),
+  ]);
+  const subscription = lifecycleSubscription({ status: 'active' });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.updated',
+    object: subscription,
+    eventId: 'evt_sub_inconsistent_update',
+  });
+
+  assert.equal(status, 200);
+
+  const user = db.users.get(VENDOR_ID)!;
+  assert.equal(user.subscriptionPlan, 'free');
+  assert.equal(db.updateOneCalls.length, 1);
+  const set = (db.updateOneCalls[0].update as { $set: Record<string, unknown> })
+    .$set;
+  assert.equal(set.subscriptionPlan, undefined);
+});
+
+test('customer.subscription.updated ignores stale events for a replaced subscription', async () => {
+  const db = createMockDatabase([
+    premiumVendor({ stripeSubscriptionId: 'sub_replaced' }),
+  ]);
+  const subscription = lifecycleSubscription({ status: 'active' });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.updated',
+    object: subscription,
+    eventId: 'evt_sub_stale_update',
+  });
+
+  assert.equal(status, 200);
+
+  const user = db.users.get(VENDOR_ID)!;
+  assert.equal(user.subscriptionPlan, 'premium');
+  assert.equal(user.stripeSubscriptionId, 'sub_replaced');
+  assert.equal(db.updateOneCalls.length, 0);
+  assert.equal(db.webhookEvents.size, 0);
+});
+
+test('customer.subscription.updated ignores invalid vendor metadata', async () => {
+  const db = createMockDatabase([premiumVendor()]);
+  const subscription = lifecycleSubscription({
+    metadata: { vendorId: 'not-a-valid-id' },
+  });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.updated',
+    object: subscription,
+    eventId: 'evt_sub_invalid_vendor',
+  });
+
+  assert.equal(status, 200);
+  assert.equal(db.updateOneCalls.length, 0);
+  assert.equal(db.webhookEvents.size, 0);
+});
+
+test('customer.subscription.updated ignores customer accounts', async () => {
+  const db = createMockDatabase([
+    { ...customerUser(), stripeSubscriptionId: 'sub_test_123' },
+  ]);
+  const subscription = lifecycleSubscription({ status: 'active' });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.updated',
+    object: subscription,
+    eventId: 'evt_sub_customer_update',
+  });
+
+  assert.equal(status, 200);
+
+  const user = db.users.get(CUSTOMER_ID)!;
+  assert.equal(user.role, 'customer');
+  assert.equal(user.subscriptionPlan, 'free');
+  assert.equal(db.updateOneCalls.length, 0);
+});
+
+test('customer.subscription.updated supports legacy top-level period end', async () => {
+  const db = createMockDatabase([premiumVendor()]);
+  const subscription = lifecycleSubscription({
+    items: {
+      data: [{ price: { id: 'price_premium_test' } }],
+    },
+    current_period_end: 1893456000,
+  });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.updated',
+    object: subscription,
+    eventId: 'evt_sub_legacy_period',
+  });
+
+  assert.equal(status, 200);
+  const user = db.users.get(VENDOR_ID)!;
+  assert.equal(
+    user.subscriptionCurrentPeriodEnd,
+    '2030-01-01T00:00:00.000Z',
+  );
+});
+
+test('customer.subscription.deleted downgrades the matching vendor to Free', async () => {
+  const db = createMockDatabase([premiumVendor()]);
+
+  // Historical transaction records must be preserved.
+  db.transactionCalls.push({
+    document: {
+      vendorId: VENDOR_ID,
+      stripeCheckoutSessionId: 'cs_historical',
+      stripeCustomerId: 'cus_test_123',
+      stripeSubscriptionId: 'sub_test_123',
+      amount: 999,
+      currency: 'usd',
+      status: 'paid',
+      createdAt: new Date(),
+    },
+  });
+
+  const subscription = lifecycleSubscription({
+    status: 'canceled',
+    cancel_at_period_end: false,
+  });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.deleted',
+    object: subscription,
+    eventId: 'evt_sub_deleted',
+  });
+
+  assert.equal(status, 200);
+
+  const user = db.users.get(VENDOR_ID)!;
+  assert.equal(user.subscriptionPlan, 'free');
+  assert.equal(user.subscriptionStatus, 'canceled');
+  assert.equal(user.subscriptionCancelAtPeriodEnd, false);
+  assert.equal(user.stripeSubscriptionId, null);
+  assert.equal(
+    user.subscriptionCurrentPeriodEnd,
+    '2030-01-01T00:00:00.000Z',
+  );
+
+  assert.equal(db.updateOneCalls.length, 1);
+  assert.equal(db.transactionCalls.length, 1);
+
+  const event = db.webhookEvents.get('evt_sub_deleted');
+  assert.ok(event);
+  assert.equal(event.status, 'completed');
+});
+
+test('customer.subscription.deleted does not downgrade a replaced subscription', async () => {
+  const db = createMockDatabase([
+    premiumVendor({ stripeSubscriptionId: 'sub_replaced' }),
+  ]);
+  const subscription = lifecycleSubscription({ status: 'canceled' });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.deleted',
+    object: subscription,
+    eventId: 'evt_sub_stale_deleted',
+  });
+
+  assert.equal(status, 200);
+
+  const user = db.users.get(VENDOR_ID)!;
+  assert.equal(user.subscriptionPlan, 'premium');
+  assert.equal(user.stripeSubscriptionId, 'sub_replaced');
+  assert.equal(db.updateOneCalls.length, 0);
+});
+
+test('customer.subscription.deleted ignores nonexistent vendors', async () => {
+  const db = createMockDatabase([]);
+  const subscription = lifecycleSubscription({ status: 'canceled' });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.deleted',
+    object: subscription,
+    eventId: 'evt_sub_missing_vendor',
+  });
+
+  assert.equal(status, 200);
+  assert.equal(db.updateOneCalls.length, 0);
+  assert.equal(db.webhookEvents.size, 0);
+});
+
+test('duplicate subscription lifecycle event is acknowledged without re-processing', async () => {
+  const db = createMockDatabase([premiumVendor()]);
+  db.webhookEvents.set('evt_sub_deleted_duplicate', {
+    stripeEventId: 'evt_sub_deleted_duplicate',
+    eventType: 'customer.subscription.deleted',
+    status: 'completed',
+    vendorId: VENDOR_ID,
+    processedAt: new Date(),
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+
+  const subscription = lifecycleSubscription({ status: 'canceled' });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    eventType: 'customer.subscription.deleted',
+    object: subscription,
+    eventId: 'evt_sub_deleted_duplicate',
+  });
+
+  assert.equal(status, 200);
+
+  const user = db.users.get(VENDOR_ID)!;
+  assert.equal(user.subscriptionPlan, 'premium');
+  assert.equal(db.updateOneCalls.length, 0);
+});
+
+test('subscription lifecycle database failure returns retryable 500', async () => {
+  const db = createMockDatabase([premiumVendor()]);
+  const baseDb = createDbMock(db);
+
+  const failingDb = {
+    collection: (name: string) => {
+      if (name === 'user') {
+        return {
+          findOne: async () => db.users.get(VENDOR_ID) ?? null,
+          updateOne: async () => {
+            throw new Error('Database write failed');
+          },
+        } as never;
+      }
+
+      return baseDb.collection(name);
+    },
+  } as unknown as Db;
+
+  const subscription = lifecycleSubscription({ status: 'active' });
+
+  const status = await deliverLifecycleEvent({
+    db,
+    database: failingDb,
+    eventType: 'customer.subscription.updated',
+    object: subscription,
+    eventId: 'evt_sub_failure',
+  });
+
+  assert.equal(status, 500);
+
+  const event = db.webhookEvents.get('evt_sub_failure');
+  assert.ok(!event || event.status !== 'completed');
+  const user = db.users.get(VENDOR_ID)!;
+  assert.equal(user.subscriptionPlan, 'premium');
 });

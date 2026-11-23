@@ -12,11 +12,32 @@ interface VendorStats {
   pendingBookingRequests: number;
   acceptedBookings: number;
   subscriptionPlan: string;
+  subscriptionStatus: string | null;
+  subscriptionCancelAtPeriodEnd: boolean;
+  subscriptionCurrentPeriodEnd: string | null;
+  hasActiveSubscription: boolean;
 }
 
 interface UserDocument {
   _id: ObjectId;
-  subscriptionPlan?: string | null;
+  subscriptionPlan?: unknown;
+  subscriptionStatus?: unknown;
+  subscriptionCancelAtPeriodEnd?: unknown;
+  subscriptionCurrentPeriodEnd?: unknown;
+  stripeSubscriptionId?: unknown;
+}
+
+function normalizeSubscriptionDate(value: unknown): string | null {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+
+  if (typeof value === 'string') {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+
+  return null;
 }
 
 function servicesCollection(database: Db): Collection {
@@ -48,7 +69,16 @@ export async function getVendorStats(
 
   const vendor = await usersCollection(database).findOne(
     { _id: vendorObjectId },
-    { projection: { subscriptionPlan: 1, _id: 0 } },
+    {
+      projection: {
+        subscriptionPlan: 1,
+        subscriptionStatus: 1,
+        subscriptionCancelAtPeriodEnd: 1,
+        subscriptionCurrentPeriodEnd: 1,
+        stripeSubscriptionId: 1,
+        _id: 0,
+      },
+    },
   );
 
   if (!vendor) {
@@ -65,6 +95,23 @@ export async function getVendorStats(
     vendor.subscriptionPlan === 'premium'
       ? vendor.subscriptionPlan
       : 'free';
+
+  const subscriptionStatus =
+    typeof vendor.subscriptionStatus === 'string' &&
+    vendor.subscriptionStatus.trim().length > 0
+      ? vendor.subscriptionStatus
+      : null;
+
+  const subscriptionCancelAtPeriodEnd =
+    vendor.subscriptionCancelAtPeriodEnd === true;
+
+  const subscriptionCurrentPeriodEnd = normalizeSubscriptionDate(
+    vendor.subscriptionCurrentPeriodEnd,
+  );
+
+  const hasActiveSubscription =
+    typeof vendor.stripeSubscriptionId === 'string' &&
+    vendor.stripeSubscriptionId.trim().length > 0;
 
   const [totalServices, activeServices, pendingBookingRequests, acceptedBookings] =
     await Promise.all([
@@ -89,5 +136,9 @@ export async function getVendorStats(
     pendingBookingRequests,
     acceptedBookings,
     subscriptionPlan,
+    subscriptionStatus,
+    subscriptionCancelAtPeriodEnd,
+    subscriptionCurrentPeriodEnd,
+    hasActiveSubscription,
   };
 }

@@ -4,7 +4,11 @@ import { authenticate } from '../middleware/authenticate.js';
 import { authorizeRoles } from '../middleware/authorize.js';
 import { enforceBlockStatus } from '../middleware/block-status.js';
 import { AppError } from '../utils/app-error.js';
-import { createSubscriptionCheckoutSession } from '../services/subscription.service.js';
+import {
+  createSubscriptionCheckoutSession,
+  scheduleVendorSubscriptionCancellation,
+} from '../services/subscription.service.js';
+import type { StripeClient } from '../services/stripe.service.js';
 
 interface SubscriptionRouterOptions {
   /**
@@ -13,6 +17,11 @@ interface SubscriptionRouterOptions {
    * every checkout request still runs the real authentication middleware.
    */
   authenticate?: RequestHandler;
+  /**
+   * Injected Stripe client for isolated tests. Production callers omit it, so
+   * the live client from getStripe() is used.
+   */
+  stripeClient?: StripeClient;
 }
 
 function requireVendorId(request: Request): string {
@@ -41,12 +50,37 @@ export function createSubscriptionRouter(
     // is derived exclusively from the authenticated JWT subject.
     void request.body;
 
-    const result = await createSubscriptionCheckoutSession(database, vendorId);
+    const result = await createSubscriptionCheckoutSession(
+      database,
+      vendorId,
+      options.stripeClient,
+    );
 
     response.status(200).json({
       success: true,
       checkoutUrl: result.checkoutUrl,
       sessionId: result.sessionId,
+    });
+  });
+
+  router.post('/subscription/cancel', async (request, response) => {
+    const vendorId = requireVendorId(request);
+
+    // Client-supplied body fields are intentionally ignored.
+    void request.body;
+
+    const result = await scheduleVendorSubscriptionCancellation(
+      database,
+      vendorId,
+      options.stripeClient,
+    );
+
+    response.status(200).json({
+      success: true,
+      cancelled: result.cancelled,
+      cancelAtPeriodEnd: result.cancelAtPeriodEnd,
+      currentPeriodEnd: result.currentPeriodEnd,
+      subscriptionStatus: result.subscriptionStatus,
     });
   });
 
